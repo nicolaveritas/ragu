@@ -1,0 +1,19 @@
+[project]
+name = "ragu"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "ipykernel",
+    "kagglehub",
+    "matplotlib",
+    "pandas",
+    "pyarrow",
+]
+
+[dependency-groups]
+dev = [
+    "kagglehub>=1.0.2",
+    "pandas>=3.0.4",
+]
