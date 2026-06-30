@@ -10,10 +10,12 @@ dependencies = [
     "matplotlib",
     "pandas",
     "pyarrow",
+    "wordcloud",
 ]
 
 [dependency-groups]
 dev = [
     "kagglehub>=1.0.2",
     "pandas>=3.0.4",
+    "qdrant-client>=1.18.0",
 ]
