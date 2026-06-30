@@ -16,6 +16,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "kagglehub>=1.0.2",
+    "openai>=2.44.0",
     "pandas>=3.0.4",
     "qdrant-client>=1.18.0",
 ]
