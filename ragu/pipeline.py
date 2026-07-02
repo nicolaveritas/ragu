@@ -130,24 +130,40 @@ def build_qdrant_filter(constraints: list[Constraint]) -> models.Filter | None:
     )
 
 
-def query_points_with_filter(embedding, qfilter, k=5, collection_name=DEFAULT_COLLECTION):
+def query_points_with_filter(query, qfilter, k=5, collection_name=DEFAULT_COLLECTION):
+    query_embedding = get_embedding(query)
     return qdrant_client.query_points(
         collection_name=collection_name,
-        query=embedding,
-        limit=k,
-        query_filter=qfilter,
+        prefetch=[
+            models.Prefetch(
+                query=query_embedding,
+                filter=qfilter,
+                using="text-embedding-3-small",
+                limit=20
+            ),
+            models.Prefetch(
+                query=models.Document(
+                    text=query,
+                    model="Qdrant/bm25",
+                ),
+                filter=qfilter,
+                using="bm25",
+                limit=20
+            )
+        ],
+        query=models.FusionQuery(fusion="rrf"),
+        limit=k
     )
 
 
 def query_points_with_fallback(query, k=5, collection_name=DEFAULT_COLLECTION):
-    query_embedding = get_embedding(query)
     extracted = extract_constraints(query)
     qfilter = build_qdrant_filter(extracted.constraints)
 
-    results = query_points_with_filter(query_embedding, qfilter, k, collection_name)
+    results = query_points_with_filter(query, qfilter, k, collection_name)
     filter_relaxed = False
     if qfilter is not None and not results.points:
-        results = query_points_with_filter(query_embedding, None, k, collection_name)
+        results = query_points_with_filter(query, None, k, collection_name)
         filter_relaxed = True
 
     return {

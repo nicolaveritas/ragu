@@ -34,7 +34,7 @@ from ragu.pipeline import rag_pipeline
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-EVAL_COLLECTION_NAME = "Recipes-collection-01-eval-sample-100"
+EVAL_COLLECTION_NAME = "Recipes-collection-01-hybrid-eval-sample-100"
 DATASET_NAME = "ragu-evaluation-dataset"
 
 ls_client = Client()
