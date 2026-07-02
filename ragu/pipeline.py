@@ -1,0 +1,289 @@
+"""
+Recipe RAG pipeline: query understanding -> filtered retrieval -> generation.
+"""
+
+import os
+from pathlib import Path
+from typing import Literal
+
+import instructor
+import openai
+from dotenv import load_dotenv
+from langsmith import get_current_run_tree, traceable
+from pydantic import BaseModel, Field
+from qdrant_client import QdrantClient, models
+
+load_dotenv(Path(__file__).parent.parent / ".env")
+
+DEFAULT_COLLECTION = "Recipes-collection-01"
+
+qdrant_client = QdrantClient(url=os.getenv("QDRANT_URL", "http://localhost:6333"))
+
+
+@traceable(
+    name="embed_query",
+    run_type="embedding",
+    metadata={"ls_provider": "openai", "ls_model_name": "text-embedding-3-small"},
+)
+def get_embedding(text, model="text-embedding-3-small"):
+    response = openai.embeddings.create(input=text, model=model)
+    current_run = get_current_run_tree()
+    if current_run:
+        current_run.metadata["usage_metadata"] = {
+            "input_tokens": response.usage.prompt_tokens,
+            "total_tokens": response.usage.total_tokens,
+        }
+    return response.data[0].embedding
+
+
+class Constraint(BaseModel):
+    field: Literal['Calories', 'ProteinContent', 'CarbohydrateContent', 'FatContent', 'total_time_minutes'] = Field(
+        description=(
+            "Recipe attribute the constraint applies to. Units are fixed: "
+            "Calories is kcal; ProteinContent, CarbohydrateContent and FatContent are grams; "
+            "total_time_minutes is minutes."
+        )
+    )
+    op: Literal['gt', 'gte', 'lt', 'lte'] = Field(
+        description=(
+            "Comparison operator. 'more than' -> gt, 'at least' / 'or more' -> gte, "
+            "'less than' / 'under' -> lt, 'at most' / 'or less' / 'max' -> lte."
+        )
+    )
+    value: float = Field(
+        description=(
+            "Threshold, converted to the field's unit when the query uses a different one "
+            "(e.g. 'ready in 2 hours' -> 120 for total_time_minutes)."
+        )
+    )
+
+
+class ExtractedConstraints(BaseModel):
+    reasoning: str = Field(
+        description="Short analysis of which numeric thresholds, if any, the query explicitly states."
+    )
+    constraints: list[Constraint] = Field(
+        description="Numeric constraints explicitly stated in the query. Empty if it states none."
+    )
+
+
+extractor_client = instructor.from_provider(
+    "openai/gpt-5.4-nano",
+    mode=instructor.Mode.RESPONSES_TOOLS,
+)
+
+EXTRACTOR_PROMPT = """
+You are the query-understanding step of a recipe search pipeline. Given a user query, extract the numeric constraints it explicitly states, so they can be turned into database filters. Semantic search handles everything else about the query; your only job is the numbers.
+
+Rules:
+- Extract a constraint ONLY when the query states an explicit numeric threshold. Numbers written as words ("half an hour", "two hours") count as explicit.
+- Vague qualifiers ("quick", "light", "low carb", "high protein", "hearty") are NOT constraints. Never invent a number for them.
+- Ignore numbers that do not refer to one of the schema fields: servings ("for 4 people"), ingredient counts, oven temperatures, etc.
+- A time budget stated by the user ("I have 2 hours") means total_time_minutes <= that value.
+
+Example 1:
+query: "find a sweet breakfast with less than 500 cal"
+constraints: [{ "field": "Calories", "op": "lt", "value": 500 }]
+
+Example 2:
+query: "I have 2 hours and need to make a dinner and I need at least 25g of proteins, what can I do?"
+constraints: [{ "field": "total_time_minutes", "op": "lte", "value": 120 }, { "field": "ProteinContent", "op": "gte", "value": 25 }]
+
+Example 3:
+query: "quick high protein pasta for 4 people"
+constraints: []  (no explicit threshold: "quick" and "high protein" are vague, "4 people" is servings)
+"""
+
+
+@traceable(
+    name="extract_constraints",
+    run_type="llm",
+    metadata={"ls_provider": "openai", "ls_model_name": "gpt-5.4-nano"},
+)
+def extract_constraints(query: str) -> ExtractedConstraints:
+    result, completion = extractor_client.create_with_completion(
+        messages=[
+            {"role": "system", "content": EXTRACTOR_PROMPT},
+            {"role": "user", "content": query},
+        ],
+        reasoning={"effort": "none"},
+        response_model=ExtractedConstraints,
+    )
+    current_run = get_current_run_tree()
+    if current_run:
+        current_run.metadata["usage_metadata"] = {
+            "input_tokens": completion.usage.input_tokens,
+            "output_tokens": completion.usage.output_tokens,
+            "total_tokens": completion.usage.total_tokens,
+        }
+    return result
+
+
+def build_qdrant_filter(constraints: list[Constraint]) -> models.Filter | None:
+    if not constraints:
+        return None
+    return models.Filter(
+        must=[
+            models.FieldCondition(key=c.field, range=models.Range(**{c.op: c.value}))
+            for c in constraints
+        ]
+    )
+
+
+def query_points_with_filter(embedding, qfilter, k=5, collection_name=DEFAULT_COLLECTION):
+    return qdrant_client.query_points(
+        collection_name=collection_name,
+        query=embedding,
+        limit=k,
+        query_filter=qfilter,
+    )
+
+
+def query_points_with_fallback(query, k=5, collection_name=DEFAULT_COLLECTION):
+    query_embedding = get_embedding(query)
+    extracted = extract_constraints(query)
+    qfilter = build_qdrant_filter(extracted.constraints)
+
+    results = query_points_with_filter(query_embedding, qfilter, k, collection_name)
+    filter_relaxed = False
+    if qfilter is not None and not results.points:
+        results = query_points_with_filter(query_embedding, None, k, collection_name)
+        filter_relaxed = True
+
+    return {
+        "results": results,
+        "constraints": extracted.constraints,
+        "filter_relaxed": filter_relaxed,
+    }
+
+
+@traceable(name="retrieve_data", run_type="retriever")
+def retrieve_data(query, k=5, collection_name=DEFAULT_COLLECTION):
+    out = query_points_with_fallback(query, k, collection_name)
+    recipes = []
+    for result in out["results"].points:
+        payload = result.payload
+        recipes.append({
+            "id": int(payload["RecipeId"]),
+            "name": payload["Name"],
+            "score": result.score,
+            "rating": payload["bayesian_rating"],
+            "n_ratings": payload["n_ratings"],
+            "calories": payload.get("Calories"),
+            "protein": payload.get("ProteinContent"),
+            "carbs": payload.get("CarbohydrateContent"),
+            "fat": payload.get("FatContent"),
+            "total_time": payload.get("total_time_minutes"),
+            "ingredients": payload.get("RecipeIngredientParts") or [],
+            "instructions": payload.get("RecipeInstructions") or [],
+        })
+    return {
+        "recipes": recipes,
+        "constraints": [c.model_dump() for c in out["constraints"]],
+        "filter_relaxed": out["filter_relaxed"],
+    }
+
+
+@traceable(name="format_retrieved_context", run_type="prompt")
+def format_blocks(retrieved, max_steps_chars=300):
+    blocks = []
+    for i, r in enumerate(retrieved, start=1):
+        nutrition = []
+        if r["calories"] is not None:
+            nutrition.append(f"{round(r['calories'])} kcal")
+        if r["protein"] is not None:
+            nutrition.append(f"P {round(r['protein'])}g")
+        if r["carbs"] is not None:
+            nutrition.append(f"C {round(r['carbs'])}g")
+        if r["fat"] is not None:
+            nutrition.append(f"F {round(r['fat'])}g")
+
+        ingredients = ", ".join(str(x) for x in r["ingredients"] if x)
+        steps = " ".join(str(s) for s in r["instructions"] if s)
+        if len(steps) > max_steps_chars:
+            steps = steps[:max_steps_chars].rstrip() + "..."
+        tt = r["total_time"]
+
+        blocks.append(
+            f"[{i}] {r['name']} (id: {r['id']})\n"
+            f"  rating: {r['rating']:.1f} ({r['n_ratings']} reviews)\n"
+            f"  nutrition: {' | '.join(nutrition) or 'n/a'}\n"
+            f"  total time: {f'{tt} min' if tt is not None else 'n/a'}\n"
+            f"  ingredients: {ingredients}\n"
+            f"  steps: {steps}"
+        )
+    return blocks
+
+
+@traceable(name="build_prompt", run_type="prompt")
+def build_system_prompt(context, constraints_not_satisfied=False):
+    note = ""
+    if constraints_not_satisfied:
+        note = "No recipe satisfies the user's numeric constraints; the ones below are the closest matches — say so honestly."
+
+    return f"""
+You are a helpful cooking assistant. You help people decide what to cook by recommending recipes from the ones available below.
+Instructions:
+- Only recommend recipes from the available recipes. Never invent recipes, ingredients, or nutrition values.
+- Refer to recipes by their name; you may add the id in parentheses so it can be looked up.
+- If the question has constraints (calories, time, an ingredient to include or avoid, a meal type), respect them and prefer recipes that match.
+- If none of the available recipes fit the request well, say so honestly instead of forcing a poor match.
+- The steps shown are only a short preview, not the full method, so don't present them as complete instructions.
+- Keep the answer concise and friendly. Do not use markdown.
+
+{note}
+Available recipes:
+{context}
+"""
+
+
+@traceable(
+    name="generate_answer",
+    run_type="llm",
+    metadata={"ls_provider": "openai", "ls_model_name": "gpt-5.4-nano"},
+)
+def generate_answer(system_prompt, question):
+    response = openai.chat.completions.create(
+        model="gpt-5.4-nano",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question},
+        ],
+        reasoning_effort="none",
+    )
+    current_run = get_current_run_tree()
+    if current_run:
+        current_run.metadata["usage_metadata"] = {
+            "input_tokens": response.usage.prompt_tokens,
+            "output_tokens": response.usage.completion_tokens,
+            "total_tokens": response.usage.total_tokens,
+        }
+    return response.choices[0].message.content
+
+
+@traceable(name="rag_pipeline", run_type="chain")
+def rag_pipeline(question, k=5, collection_name=DEFAULT_COLLECTION):
+    retrieved = retrieve_data(question, k, collection_name)
+    filter_relaxed = retrieved["filter_relaxed"]
+    recipes = retrieved["recipes"]
+    blocks = format_blocks(recipes)
+    system_prompt = build_system_prompt("\n\n".join(blocks), constraints_not_satisfied=filter_relaxed)
+    answer = generate_answer(system_prompt, question)
+    return {
+        "question": question,
+        "answer": answer,
+        "constraints": retrieved["constraints"],
+        "filter_relaxed": filter_relaxed,
+        "retrieved_context_ids": [r["id"] for r in recipes],
+        "retrieved_context": blocks,
+        "retrieved_payloads": [
+            {
+                "Calories": r["calories"],
+                "ProteinContent": r["protein"],
+                "CarbohydrateContent": r["carbs"],
+                "FatContent": r["fat"],
+                "total_time_minutes": r["total_time"],
+            }
+            for r in recipes
+        ],
+    }
