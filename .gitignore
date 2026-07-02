@@ -9,7 +9,14 @@ wheels/
 # Virtual environments
 .venv
 
+# Local datasets (downloaded from Kaggle, not redistributed)
 data
+
+# Qdrant vector store persistence (Docker volume mount)
 qdrant_data
 
+# Environment variables and secrets
 .env
+
+# Editor-specific settings
+.vscode
