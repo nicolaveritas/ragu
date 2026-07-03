@@ -33,9 +33,11 @@ from ragas.metrics.collections import AnswerRelevancy, Faithfulness
 from pydantic import BaseModel
 
 from ragu.pipeline import rag_pipeline
+from ragu.prompt_loader import render_prompt
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
+PROMPTS_DIR = Path(__file__).parent / "prompts"
 EVAL_COLLECTION_NAME = "Recipes-collection-01-hybrid-eval-sample-100"
 DATASET_NAME = "ragu-evaluation-dataset"
 EXPERIMENT_PREFIX="ragu-retriever-rerank"
@@ -157,27 +159,21 @@ class DeclineJudgment(BaseModel):
     declined: bool
 
 
-DECLINE_JUDGE_PROMPT = """\
-You judge the answer of a recipe assistant. The user asked for something the \
-recipe catalog does not contain, so the correct behavior is to say so.
-
-declined=true if the answer clearly states that no available recipe matches \
-the request. Offering alternatives is fine ONLY if they are explicitly labeled \
-as not being what was asked for (e.g. "closest matches").
-declined=false if the answer presents any recipe as if it satisfies the request.\
-"""
-
-
 async def eval_correctly_declined(run, example):
     if (example.metadata or {}).get("bucket") != "unanswerable":
         return {"key": "correctly_declined", "score": None}
     completion = await async_openai_client.chat.completions.parse(
         model="gpt-5.4-mini",
         messages=[
-            {"role": "system", "content": DECLINE_JUDGE_PROMPT},
+            {"role": "system", "content": render_prompt(PROMPTS_DIR, "decline_judge")},
             {
                 "role": "user",
-                "content": f"Question: {run.outputs['question']}\n\nAnswer: {run.outputs['answer']}",
+                "content": render_prompt(
+                    PROMPTS_DIR,
+                    "decline_judge_user",
+                    question=run.outputs["question"],
+                    answer=run.outputs["answer"],
+                ),
             },
         ],
         response_format=DeclineJudgment,

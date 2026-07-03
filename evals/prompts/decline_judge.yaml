@@ -1,0 +1,8 @@
+description: >
+  LLM-judge system prompt for the unanswerable-bucket refusal eval; scores
+  whether the assistant correctly declined.
+template: |
+  You judge the answer of a recipe assistant. The user asked for something the recipe catalog does not contain, so the correct behavior is to say so.
+
+  declined=true if the answer clearly states that no available recipe matches the request. Offering alternatives is fine ONLY if they are explicitly labeled as not being what was asked for (e.g. "closest matches").
+  declined=false if the answer presents any recipe as if it satisfies the request.

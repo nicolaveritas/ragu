@@ -14,8 +14,11 @@ from langsmith import get_current_run_tree, traceable
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient, models
 
+from ragu.prompt_loader import render_prompt
+
 load_dotenv(Path(__file__).parent.parent / ".env")
 
+PROMPTS_DIR = Path(__file__).parent / "prompts"
 DEFAULT_COLLECTION = "Recipes-collection-01-hybrid"
 
 qdrant_client = QdrantClient(url=os.getenv("QDRANT_URL", "http://localhost:6333"))
@@ -73,29 +76,6 @@ extractor_client = instructor.from_provider(
     mode=instructor.Mode.RESPONSES_TOOLS,
 )
 
-EXTRACTOR_PROMPT = """
-You are the query-understanding step of a recipe search pipeline. Given a user query, extract the numeric constraints it explicitly states, so they can be turned into database filters. Semantic search handles everything else about the query; your only job is the numbers.
-
-Rules:
-- Extract a constraint ONLY when the query states an explicit numeric threshold. Numbers written as words ("half an hour", "two hours") count as explicit.
-- Vague qualifiers ("quick", "light", "low carb", "high protein", "hearty") are NOT constraints. Never invent a number for them.
-- Ignore numbers that do not refer to one of the schema fields: servings ("for 4 people"), ingredient counts, oven temperatures, etc.
-- A time budget stated by the user ("I have 2 hours") means total_time_minutes <= that value.
-
-Example 1:
-query: "find a sweet breakfast with less than 500 cal"
-constraints: [{ "field": "Calories", "op": "lt", "value": 500 }]
-
-Example 2:
-query: "I have 2 hours and need to make a dinner and I need at least 25g of proteins, what can I do?"
-constraints: [{ "field": "total_time_minutes", "op": "lte", "value": 120 }, { "field": "ProteinContent", "op": "gte", "value": 25 }]
-
-Example 3:
-query: "quick high protein pasta for 4 people"
-constraints: []  (no explicit threshold: "quick" and "high protein" are vague, "4 people" is servings)
-"""
-
-
 @traceable(
     name="extract_constraints",
     run_type="llm",
@@ -104,7 +84,7 @@ constraints: []  (no explicit threshold: "quick" and "high protein" are vague, "
 def extract_constraints(query: str) -> ExtractedConstraints:
     result, completion = extractor_client.create_with_completion(
         messages=[
-            {"role": "system", "content": EXTRACTOR_PROMPT},
+            {"role": "system", "content": render_prompt(PROMPTS_DIR, "extract_constraints")},
             {"role": "user", "content": query},
         ],
         reasoning={"effort": "none"},
@@ -240,24 +220,12 @@ def format_blocks(retrieved, max_steps_chars=300):
 
 @traceable(name="build_prompt", run_type="prompt")
 def build_system_prompt(context, constraints_not_satisfied=False):
-    note = ""
-    if constraints_not_satisfied:
-        note = "No recipe satisfies the user's numeric constraints; the ones below are the closest matches — say so honestly."
-
-    return f"""
-You are a helpful cooking assistant. You help people decide what to cook by recommending recipes from the ones available below.
-Instructions:
-- Only recommend recipes from the available recipes. Never invent recipes, ingredients, or nutrition values.
-- Refer to recipes by their name; you may add the id in parentheses so it can be looked up.
-- If the question has constraints (calories, time, an ingredient to include or avoid, a meal type), respect them and prefer recipes that match.
-- If none of the available recipes fit the request well, say so honestly instead of forcing a poor match.
-- The steps shown are only a short preview, not the full method, so don't present them as complete instructions.
-- Keep the answer concise and friendly. Do not use markdown.
-
-{note}
-Available recipes:
-{context}
-"""
+    return render_prompt(
+        PROMPTS_DIR,
+        "system_prompt",
+        context=context,
+        constraints_not_satisfied=constraints_not_satisfied,
+    )
 
 
 @traceable(name="rerank", run_type="retriever")

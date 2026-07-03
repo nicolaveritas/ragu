@@ -1,0 +1,8 @@
+description: User message for the decline-judge eval; carries the pipeline's question and answer to be judged.
+variables:
+  question: The question sent to the pipeline.
+  answer: The pipeline's generated answer.
+template: |
+  Question: {{ question }}
+
+  Answer: {{ answer }}
