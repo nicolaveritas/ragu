@@ -1,8 +1,11 @@
 """Streamlit chat UI for ragu: chat in the main area, retrieved recipes in the sidebar."""
 
+import os
+
+import httpx
 import streamlit as st
 
-from ragu.pipeline import rag_pipeline
+API_URL = os.getenv("RAGU_API_URL", "http://localhost:8000")
 
 st.set_page_config(page_title="Ragù", page_icon="🍝", layout="wide")
 
@@ -78,7 +81,11 @@ if prompt := st.chat_input("e.g. high-protein dinner under 600 kcal, ready in 30
     with st.chat_message("user"):
         st.markdown(prompt)
     with st.chat_message("assistant"), st.spinner("Searching recipes…"):
-        result = rag_pipeline(prompt)
+        try:
+            result = httpx.post(f"{API_URL}/chat", json={"question": prompt}, timeout=60).json()
+        except httpx.HTTPError:
+            st.error(f"Can't reach the API at {API_URL}. Is it running? (uvicorn api:app)")
+            st.stop()
         st.markdown(result["answer"])
     st.session_state.messages.append({"role": "assistant", "content": result["answer"]})
     st.session_state.recipes = result["recipes"]

@@ -23,6 +23,16 @@ path = kagglehub.dataset_download("irkaal/foodcom-recipes-and-reviews")
 
 Then point the ingestion pipeline at the downloaded `recipes.parquet` / `reviews.parquet`.
 
+## Running
+
+The pipeline is served by a FastAPI backend; the Streamlit UI is a client that talks to it over HTTP. Copy `.env.example` to `.env` and fill in the keys, then:
+
+```bash
+./run.sh
+```
+
+This starts Qdrant (Docker) and runs the API (:8000, docs at `/docs`) and UI (:8501) with hot reload; Ctrl-C stops the app. Set `RAGU_API_URL` if the API lives elsewhere.
+
 ## Status
 
 Work in progress.
