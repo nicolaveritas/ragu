@@ -51,8 +51,9 @@ verify the judge's reasoning in the trace on a sample basis.
 
 | Metric | Answers |
 |---|---|
-| **faithfulness** | "Are the claims in the answer supported by the retrieved recipes, or did the model make things up?" (measures hallucinations) |
+| **faithfulness** | "Are the claims in the answer supported by the retrieved recipes, or did the model make things up?" (measures hallucinations) Skips the `unanswerable` bucket: an honest refusal ("no match, closest are...") decomposes into unsupported claims and scores near 0 even when it's the right answer. |
 | **response_relevancy** | "Does the answer address the question asked?" It judges the text of the answer: a wrong retrieval lowers it only indirectly (if the final answer ends up off-topic). |
+| **correctly_declined** | Only bucket `unanswerable` (the mirror of faithfulness skipping it): "Did the answer clearly say no available recipe matches?" Binary. Alternatives are allowed if labeled as such; presenting a recipe as if it fits = 0. The judge's reasoning lands in the feedback comment. |
 
 ## Retrieval concepts
 

@@ -6,6 +6,7 @@ in `notebooks/06-rag-eval-dataset.ipynb`.
 - Retrieval (deterministic): context_recall, hit_at_k, mrr,
   constraint_satisfaction.
 - Generation (RAGAS, LLM-judged): faithfulness, response_relevancy.
+- Refusal (LLM-judged): correctly_declined, unanswerable bucket only.
 
 Evaluators return None where a metric doesn't apply, and LangSmith skips them.
 Metric definitions: docs/evals.md.
@@ -29,6 +30,7 @@ from openai import AsyncOpenAI
 from ragas.embeddings import OpenAIEmbeddings as RagasOpenAIEmbeddings
 from ragas.llms import llm_factory
 from ragas.metrics.collections import AnswerRelevancy, Faithfulness
+from pydantic import BaseModel
 
 from ragu.pipeline import rag_pipeline
 
@@ -127,6 +129,10 @@ def eval_constraint_satisfaction(run, example):
 
 
 async def eval_faithfulness(run, example):
+    # RAGAS faithfulness punishes honest refusals ("no match, closest are...")
+    # as unsupported claims, so it doesn't apply to the unanswerable bucket.
+    if (example.metadata or {}).get("bucket") == "unanswerable":
+        return {"key": "faithfulness", "score": None}
     result = await faithfulness_scorer.ascore(
         user_input=run.outputs["question"],
         response=run.outputs["answer"],
@@ -143,6 +149,47 @@ async def eval_response_relevancy(run, example):
     return {"key": "response_relevancy", "score": result.value}
 
 
+# --- Refusal evaluator (unanswerable bucket) -------------------------------------
+
+
+class DeclineJudgment(BaseModel):
+    reasoning: str
+    declined: bool
+
+
+DECLINE_JUDGE_PROMPT = """\
+You judge the answer of a recipe assistant. The user asked for something the \
+recipe catalog does not contain, so the correct behavior is to say so.
+
+declined=true if the answer clearly states that no available recipe matches \
+the request. Offering alternatives is fine ONLY if they are explicitly labeled \
+as not being what was asked for (e.g. "closest matches").
+declined=false if the answer presents any recipe as if it satisfies the request.\
+"""
+
+
+async def eval_correctly_declined(run, example):
+    if (example.metadata or {}).get("bucket") != "unanswerable":
+        return {"key": "correctly_declined", "score": None}
+    completion = await async_openai_client.chat.completions.parse(
+        model="gpt-5.4-mini",
+        messages=[
+            {"role": "system", "content": DECLINE_JUDGE_PROMPT},
+            {
+                "role": "user",
+                "content": f"Question: {run.outputs['question']}\n\nAnswer: {run.outputs['answer']}",
+            },
+        ],
+        response_format=DeclineJudgment,
+    )
+    judgment = completion.choices[0].message.parsed
+    return {
+        "key": "correctly_declined",
+        "score": 1.0 if judgment.declined else 0.0,
+        "comment": judgment.reasoning,
+    }
+
+
 # --- Experiment ----------------------------------------------------------------
 
 
@@ -150,10 +197,11 @@ async def run_experiment(smoke: bool):
     if smoke:
         dataset = ls_client.read_dataset(dataset_name=DATASET_NAME)
         examples = list(ls_client.list_examples(dataset_id=dataset.id))
-        # 2 gold-id examples + 1 constraint example exercise every evaluator.
+        # 2 gold-id + 1 constraint + 1 unanswerable exercise every evaluator.
         with_gold = [e for e in examples if (e.outputs or {}).get("reference_context_ids")]
         constraint = [e for e in examples if (e.outputs or {}).get("constraints")]
-        data = with_gold[:2] + constraint[:1]
+        unanswerable = [e for e in examples if (e.metadata or {}).get("bucket") == "unanswerable"]
+        data = with_gold[:2] + constraint[:1] + unanswerable[:1]
         experiment_prefix = "ragu-retriever-smoketest"
     else:
         data = DATASET_NAME
@@ -172,6 +220,7 @@ async def run_experiment(smoke: bool):
             eval_constraint_satisfaction,
             eval_faithfulness,
             eval_response_relevancy,
+            eval_correctly_declined,
         ],
         experiment_prefix=experiment_prefix,
     )
