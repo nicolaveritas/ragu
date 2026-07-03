@@ -5,12 +5,13 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "ipykernel",
-    "kagglehub",
-    "matplotlib",
-    "pandas",
-    "pyarrow",
-    "wordcloud",
+    "cohere>=7.0.5",
+    "instructor>=1.15.4",
+    "langsmith>=0.9.4",
+    "openai>=2.44.0",
+    "pydantic>=2.13.4",
+    "python-dotenv>=1.2.2",
+    "qdrant-client>=1.18.0",
 ]
 
 [build-system]
@@ -19,12 +20,11 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
-    "dotenv>=0.9.9",
-    "instructor>=1.15.4",
+    "ipykernel>=7.3.0",
     "kagglehub>=1.0.2",
-    "langsmith>=0.9.4",
-    "openai>=2.44.0",
+    "matplotlib>=3.11.0",
     "pandas>=3.0.4",
-    "qdrant-client>=1.18.0",
+    "pyarrow>=24.0.0",
     "ragas>=0.4.3",
+    "wordcloud>=1.9.6",
 ]

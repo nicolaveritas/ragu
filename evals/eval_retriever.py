@@ -36,6 +36,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 EVAL_COLLECTION_NAME = "Recipes-collection-01-hybrid-eval-sample-100"
 DATASET_NAME = "ragu-evaluation-dataset"
+EXPERIMENT_PREFIX="ragu-retriever-rerank"
 
 ls_client = Client()
 
@@ -156,7 +157,7 @@ async def run_experiment(smoke: bool):
         experiment_prefix = "ragu-retriever-smoketest"
     else:
         data = DATASET_NAME
-        experiment_prefix = "ragu-retriever-filters"
+        experiment_prefix = EXPERIMENT_PREFIX
 
     async def target(inputs: dict) -> dict:
         return rag_pipeline(inputs["question"], collection_name=EVAL_COLLECTION_NAME)

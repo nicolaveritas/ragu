@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Literal
 
+import cohere
 import instructor
 import openai
 from dotenv import load_dotenv
@@ -15,10 +16,10 @@ from qdrant_client import QdrantClient, models
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-DEFAULT_COLLECTION = "Recipes-collection-01"
+DEFAULT_COLLECTION = "Recipes-collection-01-hybrid"
 
 qdrant_client = QdrantClient(url=os.getenv("QDRANT_URL", "http://localhost:6333"))
-
+cohere_client = cohere.ClientV2()
 
 @traceable(
     name="embed_query",
@@ -182,6 +183,8 @@ def retrieve_data(query, k=5, collection_name=DEFAULT_COLLECTION):
         recipes.append({
             "id": int(payload["RecipeId"]),
             "name": payload["Name"],
+            "description": payload.get("Description"),
+            "text": payload.get("text"),
             "score": result.score,
             "rating": payload["bayesian_rating"],
             "n_ratings": payload["n_ratings"],
@@ -220,8 +223,12 @@ def format_blocks(retrieved, max_steps_chars=300):
             steps = steps[:max_steps_chars].rstrip() + "..."
         tt = r["total_time"]
 
+        desc = (r.get("description") or "").strip()
+        desc_line = f"  description: {desc}\n" if desc else ""
+
         blocks.append(
             f"[{i}] {r['name']} (id: {r['id']})\n"
+            f"{desc_line}"
             f"  rating: {r['rating']:.1f} ({r['n_ratings']} reviews)\n"
             f"  nutrition: {' | '.join(nutrition) or 'n/a'}\n"
             f"  total time: {f'{tt} min' if tt is not None else 'n/a'}\n"
@@ -253,6 +260,25 @@ Available recipes:
 """
 
 
+@traceable(name="rerank", run_type="retriever")
+def rerank(query, recipes, top_n=5):
+    if not recipes:  # ponytail: Cohere 400s on an empty/all-blank document list
+        return []
+    docs = [r.get("text") for r in recipes]
+    response = cohere_client.rerank(
+        model="rerank-v4.0-pro",
+        query=query,
+        documents=docs,
+        top_n=top_n,
+    )
+    out = []
+    for result in response.results:
+        recipe = recipes[result.index]
+        recipe["score"] = result.relevance_score # replace fusion score with rerank score
+        out.append(recipe)
+    return out
+
+
 @traceable(
     name="generate_answer",
     run_type="llm",
@@ -278,10 +304,10 @@ def generate_answer(system_prompt, question):
 
 
 @traceable(name="rag_pipeline", run_type="chain")
-def rag_pipeline(question, k=5, collection_name=DEFAULT_COLLECTION):
-    retrieved = retrieve_data(question, k, collection_name)
+def rag_pipeline(question, k=5, candidates=20, collection_name=DEFAULT_COLLECTION):
+    retrieved = retrieve_data(question, candidates, collection_name)
     filter_relaxed = retrieved["filter_relaxed"]
-    recipes = retrieved["recipes"]
+    recipes = rerank(question, retrieved["recipes"], top_n=k)
     blocks = format_blocks(recipes)
     system_prompt = build_system_prompt("\n\n".join(blocks), constraints_not_satisfied=filter_relaxed)
     answer = generate_answer(system_prompt, question)
