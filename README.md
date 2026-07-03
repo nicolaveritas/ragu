@@ -1,4 +1,4 @@
-# Ragù
+# 🍝 RAGù
 
 A retrieval-augmented generation (RAG) system built on the [Food.com recipes & reviews dataset](https://www.kaggle.com/datasets/irkaal/foodcom-recipes-and-reviews) — over 500k recipes and 1.4M user reviews, with structured fields (cooking time, nutrition, tags, ratings) alongside free-text descriptions, steps, and reviews.
 
