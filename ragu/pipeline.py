@@ -160,11 +160,15 @@ def retrieve_data(query, k=5, collection_name=DEFAULT_COLLECTION):
     recipes = []
     for result in out["results"].points:
         payload = result.payload
+        images = payload.get("Images") or []
         recipes.append({
             "id": int(payload["RecipeId"]),
             "name": payload["Name"],
             "description": payload.get("Description"),
             "text": payload.get("text"),
+            "image": images[0] if images else None,
+            "category": payload.get("RecipeCategory"),
+            "keywords": payload.get("Keywords") or [],
             "score": result.score,
             "rating": payload["bayesian_rating"],
             "n_ratings": payload["n_ratings"],
@@ -282,6 +286,7 @@ def rag_pipeline(question, k=5, candidates=20, collection_name=DEFAULT_COLLECTIO
     return {
         "question": question,
         "answer": answer,
+        "recipes": recipes,
         "constraints": retrieved["constraints"],
         "filter_relaxed": filter_relaxed,
         "retrieved_context_ids": [r["id"] for r in recipes],
