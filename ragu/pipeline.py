@@ -111,8 +111,16 @@ def build_qdrant_filter(constraints: list[Constraint]) -> models.Filter | None:
     )
 
 
-def query_points_with_filter(query, qfilter, k=5, collection_name=DEFAULT_COLLECTION):
+def query_points_with_filter(query, qfilter, k=5, collection_name=DEFAULT_COLLECTION, hybrid=True):
     query_embedding = get_embedding(query)
+    if not hybrid:  # dense-only: single vector query, no BM25 prefetch, no fusion
+        return qdrant_client.query_points(
+            collection_name=collection_name,
+            query=query_embedding,
+            using="text-embedding-3-small",
+            query_filter=qfilter,
+            limit=k,
+        )
     return qdrant_client.query_points(
         collection_name=collection_name,
         prefetch=[
@@ -137,14 +145,14 @@ def query_points_with_filter(query, qfilter, k=5, collection_name=DEFAULT_COLLEC
     )
 
 
-def query_points_with_fallback(query, k=5, collection_name=DEFAULT_COLLECTION):
+def query_points_with_fallback(query, k=5, collection_name=DEFAULT_COLLECTION, hybrid=True):
     extracted = extract_constraints(query)
     qfilter = build_qdrant_filter(extracted.constraints)
 
-    results = query_points_with_filter(query, qfilter, k, collection_name)
+    results = query_points_with_filter(query, qfilter, k, collection_name, hybrid)
     filter_relaxed = False
     if qfilter is not None and not results.points:
-        results = query_points_with_filter(query, None, k, collection_name)
+        results = query_points_with_filter(query, None, k, collection_name, hybrid)
         filter_relaxed = True
 
     return {
@@ -155,8 +163,8 @@ def query_points_with_fallback(query, k=5, collection_name=DEFAULT_COLLECTION):
 
 
 @traceable(name="retrieve_data", run_type="retriever")
-def retrieve_data(query, k=5, collection_name=DEFAULT_COLLECTION):
-    out = query_points_with_fallback(query, k, collection_name)
+def retrieve_data(query, k=5, collection_name=DEFAULT_COLLECTION, hybrid=True):
+    out = query_points_with_fallback(query, k, collection_name, hybrid)
     recipes = []
     for result in out["results"].points:
         payload = result.payload
@@ -276,10 +284,11 @@ def generate_answer(system_prompt, question):
 
 
 @traceable(name="rag_pipeline", run_type="chain")
-def rag_pipeline(question, k=5, candidates=20, collection_name=DEFAULT_COLLECTION):
-    retrieved = retrieve_data(question, candidates, collection_name)
+def rag_pipeline(question, k=5, candidates=20, collection_name=DEFAULT_COLLECTION, hybrid=True, use_rerank=True):
+    retrieved = retrieve_data(question, candidates, collection_name, hybrid=hybrid)
     filter_relaxed = retrieved["filter_relaxed"]
-    recipes = rerank(question, retrieved["recipes"], top_n=k)
+    # rerank picks + reorders the best k of `candidates`; without it, fusion top-k as-is
+    recipes = rerank(question, retrieved["recipes"], top_n=k) if use_rerank else retrieved["recipes"][:k]
     blocks = format_blocks(recipes)
     system_prompt = build_system_prompt("\n\n".join(blocks), constraints_not_satisfied=filter_relaxed)
     answer = generate_answer(system_prompt, question)

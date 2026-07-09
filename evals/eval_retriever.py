@@ -1,7 +1,7 @@
 """Run the RAG eval experiment on LangSmith.
 
 Scores the recipe RAG pipeline (ragu.pipeline) against the eval dataset built
-in `notebooks/06-rag-eval-dataset.ipynb`.
+in `notebooks/10-rag-eval-dataset-large.ipynb`.
 
 - Retrieval (deterministic): context_recall, hit_at_k, mrr,
   constraint_satisfaction.
@@ -11,18 +11,21 @@ in `notebooks/06-rag-eval-dataset.ipynb`.
 Evaluators return None where a metric doesn't apply, and LangSmith skips them.
 Metric definitions: docs/evals.md.
 
-Retrieval runs against the 100-recipe eval sample collection so every
-ground-truth recipe is guaranteed to be in the index.
+Retrieval runs against the FULL collection: gold labels are complete over the
+whole corpus (relevance-swept + verified), so no sample collection is needed.
 
 Usage (from the repo root, with Qdrant running on localhost:6333):
 
-    uv run python evals/eval_retriever.py            # full run
-    uv run python evals/eval_retriever.py --smoke    # 3-example smoke test
+    uv run python evals/eval_retriever.py            # baseline: default config, all metrics
+    uv run python evals/eval_retriever.py --sweep    # hybrid x rerank sweep, retrieval metrics only
+    uv run python evals/eval_retriever.py --smoke    # 4-example smoke test (combines with --sweep)
 """
 
 import argparse
 import asyncio
 from pathlib import Path
+
+import pandas as pd
 
 from dotenv import load_dotenv
 from langsmith import Client
@@ -38,9 +41,18 @@ from ragu.prompt_loader import render_prompt
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
-EVAL_COLLECTION_NAME = "Recipes-collection-01-hybrid-eval-sample-100"
-DATASET_NAME = "ragu-evaluation-dataset"
-EXPERIMENT_PREFIX="ragu-retriever-rerank"
+EVAL_COLLECTION_NAME = "Recipes-collection-01-hybrid"
+DATASET_NAME = "ragu-evaluation-dataset-large"
+
+DEFAULT_CONFIG = {"hybrid": True, "rerank": True, "k": 5, "candidates": 20}
+# First sweep varies only the two booleans; k/candidates get their own sweep later
+# (one variable family at a time - see plans/configurable-eval-sweep.md).
+SWEEP_CONFIGS = {
+    "dense": {**DEFAULT_CONFIG, "hybrid": False, "rerank": False},
+    "dense-rerank": {**DEFAULT_CONFIG, "hybrid": False},
+    "hybrid": {**DEFAULT_CONFIG, "rerank": False},
+    "hybrid-rerank": DEFAULT_CONFIG,
+}
 
 ls_client = Client()
 
@@ -188,50 +200,75 @@ async def eval_correctly_declined(run, example):
 
 # --- Experiment ----------------------------------------------------------------
 
+# The sweep varies the *retriever*, so it runs only the retrieval metrics; the
+# LLM-judged generation/refusal metrics mostly re-measure the generator (which
+# doesn't change across configs) and only run in the single-config baseline.
+RETRIEVAL_EVALUATORS = [eval_context_recall, eval_hit_at_k, eval_mrr, eval_constraint_satisfaction]
+GENERATION_EVALUATORS = [eval_faithfulness, eval_response_relevancy, eval_correctly_declined]
 
-async def run_experiment(smoke: bool):
-    if smoke:
-        dataset = ls_client.read_dataset(dataset_name=DATASET_NAME)
-        examples = list(ls_client.list_examples(dataset_id=dataset.id))
-        # 2 gold-id + 1 constraint + 1 unanswerable exercise every evaluator.
-        with_gold = [e for e in examples if (e.outputs or {}).get("reference_context_ids")]
-        constraint = [e for e in examples if (e.outputs or {}).get("constraints")]
-        unanswerable = [e for e in examples if (e.metadata or {}).get("bucket") == "unanswerable"]
-        data = with_gold[:2] + constraint[:1] + unanswerable[:1]
-        experiment_prefix = "ragu-retriever-smoketest"
-    else:
-        data = DATASET_NAME
-        experiment_prefix = EXPERIMENT_PREFIX
 
+async def run_one(name: str, cfg: dict, evaluators: list, data):
     async def target(inputs: dict) -> dict:
-        return rag_pipeline(inputs["question"], collection_name=EVAL_COLLECTION_NAME)
+        return rag_pipeline(
+            inputs["question"],
+            k=cfg["k"],
+            candidates=cfg["candidates"],
+            collection_name=EVAL_COLLECTION_NAME,
+            hybrid=cfg["hybrid"],
+            use_rerank=cfg["rerank"],
+        )
 
     results = await ls_client.aevaluate(
         target,
         data=data,
-        evaluators=[
-            eval_context_recall,
-            eval_hit_at_k,
-            eval_mrr,
-            eval_constraint_satisfaction,
-            eval_faithfulness,
-            eval_response_relevancy,
-            eval_correctly_declined,
-        ],
-        experiment_prefix=experiment_prefix,
+        evaluators=evaluators,
+        experiment_prefix=f"ragu-{name}",
     )
-
     df = results.to_pandas()
-    metric_cols = [c for c in df.columns if c.startswith("feedback.")]
-    print("\nMean scores:")
-    print(df[metric_cols].mean(numeric_only=True).to_string())
+    means = df[[c for c in df.columns if c.startswith("feedback.")]].mean(numeric_only=True)
+    print(f"\n[{name}] mean scores:")
+    print(means.to_string())
+    return means
+
+
+def smoke_examples():
+    dataset = ls_client.read_dataset(dataset_name=DATASET_NAME)
+    examples = list(ls_client.list_examples(dataset_id=dataset.id))
+    # 2 gold-id + 1 constraint + 1 unanswerable exercise every evaluator.
+    with_gold = [e for e in examples if (e.outputs or {}).get("reference_context_ids")]
+    constraint = [e for e in examples if (e.outputs or {}).get("constraints")]
+    unanswerable = [e for e in examples if (e.metadata or {}).get("bucket") == "unanswerable"]
+    return with_gold[:2] + constraint[:1] + unanswerable[:1]
+
+
+async def run_experiment(smoke: bool, sweep: bool, config: str | None = None):
+    data = smoke_examples() if smoke else DATASET_NAME
+    suffix = "-smoke" if smoke else ""
+
+    if config:
+        await run_one(f"sweep-{config}{suffix}", SWEEP_CONFIGS[config], RETRIEVAL_EVALUATORS, data)
+    elif sweep:
+        means = {}
+        for name, cfg in SWEEP_CONFIGS.items():
+            means[name] = await run_one(f"sweep-{name}{suffix}", cfg, RETRIEVAL_EVALUATORS, data)
+        print("\n=== sweep comparison ===")
+        print(pd.DataFrame(means).T.to_string())
+    else:
+        await run_one(
+            f"baseline{suffix}",
+            DEFAULT_CONFIG,
+            RETRIEVAL_EVALUATORS + GENERATION_EVALUATORS,
+            data,
+        )
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--smoke", action="store_true", help="run on 3 examples only")
+    parser.add_argument("--smoke", action="store_true", help="run on 4 examples only")
+    parser.add_argument("--sweep", action="store_true", help="hybrid x rerank config sweep, retrieval metrics only")
+    parser.add_argument("--config", choices=list(SWEEP_CONFIGS), help="run a single sweep config (retrieval metrics only)")
     args = parser.parse_args()
-    asyncio.run(run_experiment(smoke=args.smoke))
+    asyncio.run(run_experiment(smoke=args.smoke, sweep=args.sweep, config=args.config))
 
 
 if __name__ == "__main__":

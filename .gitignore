@@ -23,3 +23,10 @@ qdrant_data
 
 # Claude settings
 .claude/settings.local.json
+
+# Local agent context (personal, not shared; CLAUDE.md is a symlink to AGENTS.md)
+AGENTS.md
+CLAUDE.md
+
+# agents plans
+plans
