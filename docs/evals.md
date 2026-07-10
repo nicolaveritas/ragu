@@ -117,10 +117,10 @@ failure or a zero).
 
 | Bucket (n) | recall / hit@k / mrr | constraint_satisfaction | faithfulness | response_relevancy | correctly_declined |
 |---|:---:|:---:|:---:|:---:|:---:|
-| `single` (11)      | ✓ | – | ✓ | ✓ | – |
-| `multi` (3)        | ✓ | – | ✓ | ✓ | – |
+| `single` (12)      | ✓ | – | ✓ | ✓ | – |
+| `multi` (4)        | ✓ | – | ✓ | ✓ | – |
 | `constraint` (12)  | – | ✓ | ✓ | ✓ | – |
-| `unanswerable` (7) | – | – | – | ✓ | ✓ |
+| `unanswerable` (5) | – | – | – | ✓ | ✓ |
 
 ---
 
