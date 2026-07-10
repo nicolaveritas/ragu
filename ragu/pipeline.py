@@ -12,12 +12,12 @@ from dotenv import load_dotenv
 # before the langfuse-wrapped openai. Both are best practices from the langfuse skill.
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-import cohere
 import instructor
 from langfuse import observe
 from langfuse.openai import openai  # drop-in replacement: auto-traces every OpenAI call
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient, models
+from flashrank import Ranker, RerankRequest
 
 from ragu.prompt_loader import render_prompt
 
@@ -25,7 +25,8 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 DEFAULT_COLLECTION = "Recipes-collection-01-hybrid"
 
 qdrant_client = QdrantClient(url=os.getenv("QDRANT_URL", "http://localhost:6333"))
-cohere_client = cohere.ClientV2()
+RERANK_MODEL = "ms-marco-MiniLM-L-12-v2"
+ranker = Ranker(model_name=RERANK_MODEL)
 
 def get_embedding(text, model="text-embedding-3-small"):
     # langfuse.openai auto-logs an embedding generation with model + token usage;
@@ -229,17 +230,12 @@ def build_system_prompt(context, constraints_not_satisfied=False):
 def rerank(query, recipes, top_n=5):
     if not recipes:  # ponytail: Cohere 400s on an empty/all-blank document list
         return []
-    docs = [r.get("text") for r in recipes]
-    response = cohere_client.rerank(
-        model="rerank-v4.0-pro",
-        query=query,
-        documents=docs,
-        top_n=top_n,
-    )
+    docs = [{"id": i, "text": r.get("text")} for i, r in enumerate(recipes)]
+    response = ranker.rerank(RerankRequest(query=query, passages=docs))
     out = []
-    for result in response.results:
-        recipe = recipes[result.index]
-        recipe["score"] = result.relevance_score # replace fusion score with rerank score
+    for result in response[:top_n]:
+        recipe = recipes[result["id"]]
+        recipe["score"] = result["score"]
         out.append(recipe)
     return out
 

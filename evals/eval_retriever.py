@@ -25,7 +25,6 @@ Usage (from the repo root, with Qdrant + Langfuse running):
 import argparse
 from collections import defaultdict
 from pathlib import Path
-
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -38,7 +37,7 @@ from ragas.embeddings import OpenAIEmbeddings as RagasOpenAIEmbeddings
 from ragas.llms import llm_factory
 from ragas.metrics.collections import AnswerRelevancy, Faithfulness
 
-from ragu.pipeline import rag_pipeline
+from ragu.pipeline import rag_pipeline, RERANK_MODEL
 from ragu.prompt_loader import render_prompt
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -236,10 +235,13 @@ def means_from_result(result) -> dict:
 
 def run_one(name: str, cfg: dict, evaluators: list, dataset=None, data=None):
     task = make_task(cfg)
+    # SDK appends its own timestamp to the run name for uniqueness; metadata records
+    # what actually defines the run (config + which reranker, if any).
+    meta = {**cfg, "reranker": RERANK_MODEL if cfg["rerank"] else None}
     if dataset is not None:
-        result = dataset.run_experiment(name=f"ragu-{name}", task=task, evaluators=evaluators)
+        result = dataset.run_experiment(name=f"ragu-{name}", metadata=meta, task=task, evaluators=evaluators)
     else:
-        result = langfuse.run_experiment(name=f"ragu-{name}", data=data, task=task, evaluators=evaluators)
+        result = langfuse.run_experiment(name=f"ragu-{name}", data=data, metadata=meta, task=task, evaluators=evaluators)
 
     means = means_from_result(result)
     print(f"\n[{name}] mean scores  ({result.dataset_run_url or 'local run'}):")
