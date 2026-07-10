@@ -6,17 +6,20 @@ import os
 from pathlib import Path
 from typing import Literal
 
+from dotenv import load_dotenv
+
+# Load env BEFORE importing langfuse (so the SDK reads credentials at init) and
+# before the langfuse-wrapped openai. Both are best practices from the langfuse skill.
+load_dotenv(Path(__file__).parent.parent / ".env")
+
 import cohere
 import instructor
-import openai
-from dotenv import load_dotenv
-from langsmith import get_current_run_tree, traceable
+from langfuse import observe
+from langfuse.openai import openai  # drop-in replacement: auto-traces every OpenAI call
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient, models
 
 from ragu.prompt_loader import render_prompt
-
-load_dotenv(Path(__file__).parent.parent / ".env")
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 DEFAULT_COLLECTION = "Recipes-collection-01-hybrid"
@@ -24,19 +27,10 @@ DEFAULT_COLLECTION = "Recipes-collection-01-hybrid"
 qdrant_client = QdrantClient(url=os.getenv("QDRANT_URL", "http://localhost:6333"))
 cohere_client = cohere.ClientV2()
 
-@traceable(
-    name="embed_query",
-    run_type="embedding",
-    metadata={"ls_provider": "openai", "ls_model_name": "text-embedding-3-small"},
-)
 def get_embedding(text, model="text-embedding-3-small"):
-    response = openai.embeddings.create(input=text, model=model)
-    current_run = get_current_run_tree()
-    if current_run:
-        current_run.metadata["usage_metadata"] = {
-            "input_tokens": response.usage.prompt_tokens,
-            "total_tokens": response.usage.total_tokens,
-        }
+    # langfuse.openai auto-logs an embedding generation with model + token usage;
+    # `name` just labels it in the trace. No manual usage bookkeeping needed.
+    response = openai.embeddings.create(input=text, model=model, name="embed_query")
     return response.data[0].embedding
 
 
@@ -76,13 +70,12 @@ extractor_client = instructor.from_provider(
     mode=instructor.Mode.RESPONSES_TOOLS,
 )
 
-@traceable(
-    name="extract_constraints",
-    run_type="llm",
-    metadata={"ls_provider": "openai", "ls_model_name": "gpt-5.4-nano"},
-)
+@observe(name="extract_constraints")
 def extract_constraints(query: str) -> ExtractedConstraints:
-    result, completion = extractor_client.create_with_completion(
+    # instructor builds its client from the langfuse-wrapped openai, so the
+    # underlying Responses call is auto-traced as a nested generation (model +
+    # tokens captured once). We just wrap it in a clearly-named span.
+    return extractor_client.create(
         messages=[
             {"role": "system", "content": render_prompt(PROMPTS_DIR, "extract_constraints")},
             {"role": "user", "content": query},
@@ -90,14 +83,6 @@ def extract_constraints(query: str) -> ExtractedConstraints:
         reasoning={"effort": "none"},
         response_model=ExtractedConstraints,
     )
-    current_run = get_current_run_tree()
-    if current_run:
-        current_run.metadata["usage_metadata"] = {
-            "input_tokens": completion.usage.input_tokens,
-            "output_tokens": completion.usage.output_tokens,
-            "total_tokens": completion.usage.total_tokens,
-        }
-    return result
 
 
 def build_qdrant_filter(constraints: list[Constraint]) -> models.Filter | None:
@@ -162,7 +147,7 @@ def query_points_with_fallback(query, k=5, collection_name=DEFAULT_COLLECTION, h
     }
 
 
-@traceable(name="retrieve_data", run_type="retriever")
+@observe(as_type="retriever", name="retrieve_data")
 def retrieve_data(query, k=5, collection_name=DEFAULT_COLLECTION, hybrid=True):
     out = query_points_with_fallback(query, k, collection_name, hybrid)
     recipes = []
@@ -195,7 +180,7 @@ def retrieve_data(query, k=5, collection_name=DEFAULT_COLLECTION, hybrid=True):
     }
 
 
-@traceable(name="format_retrieved_context", run_type="prompt")
+@observe(name="format_retrieved_context")
 def format_blocks(retrieved, max_steps_chars=300):
     blocks = []
     for i, r in enumerate(retrieved, start=1):
@@ -230,7 +215,7 @@ def format_blocks(retrieved, max_steps_chars=300):
     return blocks
 
 
-@traceable(name="build_prompt", run_type="prompt")
+@observe(name="build_prompt")
 def build_system_prompt(context, constraints_not_satisfied=False):
     return render_prompt(
         PROMPTS_DIR,
@@ -240,7 +225,7 @@ def build_system_prompt(context, constraints_not_satisfied=False):
     )
 
 
-@traceable(name="rerank", run_type="retriever")
+@observe(as_type="retriever", name="rerank")
 def rerank(query, recipes, top_n=5):
     if not recipes:  # ponytail: Cohere 400s on an empty/all-blank document list
         return []
@@ -259,12 +244,8 @@ def rerank(query, recipes, top_n=5):
     return out
 
 
-@traceable(
-    name="generate_answer",
-    run_type="llm",
-    metadata={"ls_provider": "openai", "ls_model_name": "gpt-5.4-nano"},
-)
 def generate_answer(system_prompt, question):
+    # drop-in auto-captures model + token usage; `name` labels the generation.
     response = openai.chat.completions.create(
         model="gpt-5.4-nano",
         messages=[
@@ -272,18 +253,12 @@ def generate_answer(system_prompt, question):
             {"role": "user", "content": question},
         ],
         reasoning_effort="none",
+        name="generate_answer",
     )
-    current_run = get_current_run_tree()
-    if current_run:
-        current_run.metadata["usage_metadata"] = {
-            "input_tokens": response.usage.prompt_tokens,
-            "output_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens,
-        }
     return response.choices[0].message.content
 
 
-@traceable(name="rag_pipeline", run_type="chain")
+@observe(name="rag_pipeline")
 def rag_pipeline(question, k=5, candidates=20, collection_name=DEFAULT_COLLECTION, hybrid=True, use_rerank=True):
     retrieved = retrieve_data(question, candidates, collection_name, hybrid=hybrid)
     filter_relaxed = retrieved["filter_relaxed"]

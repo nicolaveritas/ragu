@@ -1,20 +1,21 @@
-"""Run the RAG eval experiment on LangSmith.
+"""Run the RAG eval experiment on Langfuse.
 
-Scores the recipe RAG pipeline (ragu.pipeline) against the eval dataset built
-in `notebooks/10-rag-eval-dataset-large.ipynb`.
+Scores the recipe RAG pipeline (ragu.pipeline) against the eval dataset in
+Langfuse ("ragu-evaluation-dataset-large"). Upload/refresh the dataset first
+with `evals/upload_dataset.py` (source of truth: data/eval_dataset_large.jsonl).
 
 - Retrieval (deterministic): context_recall, hit_at_k, mrr,
   constraint_satisfaction.
 - Generation (RAGAS, LLM-judged): faithfulness, response_relevancy.
 - Refusal (LLM-judged): correctly_declined, unanswerable bucket only.
 
-Evaluators return None where a metric doesn't apply, and LangSmith skips them.
-Metric definitions: docs/evals.md.
+Evaluators return [] where a metric doesn't apply, and Langfuse records no score
+for that item. Metric definitions: docs/evals.md.
 
 Retrieval runs against the FULL collection: gold labels are complete over the
 whole corpus (relevance-swept + verified), so no sample collection is needed.
 
-Usage (from the repo root, with Qdrant running on localhost:6333):
+Usage (from the repo root, with Qdrant + Langfuse running):
 
     uv run python evals/eval_retriever.py            # baseline: default config, all metrics
     uv run python evals/eval_retriever.py --sweep    # hybrid x rerank sweep, retrieval metrics only
@@ -22,23 +23,23 @@ Usage (from the repo root, with Qdrant running on localhost:6333):
 """
 
 import argparse
-import asyncio
+from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
-
 from dotenv import load_dotenv
-from langsmith import Client
+
+load_dotenv(Path(__file__).parent.parent / ".env")  # env before langfuse import
+
+from langfuse import Evaluation, get_client
 from openai import AsyncOpenAI
+from pydantic import BaseModel
 from ragas.embeddings import OpenAIEmbeddings as RagasOpenAIEmbeddings
 from ragas.llms import llm_factory
 from ragas.metrics.collections import AnswerRelevancy, Faithfulness
-from pydantic import BaseModel
 
 from ragu.pipeline import rag_pipeline
 from ragu.prompt_loader import render_prompt
-
-load_dotenv(Path(__file__).parent.parent / ".env")
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 EVAL_COLLECTION_NAME = "Recipes-collection-01-hybrid"
@@ -54,7 +55,7 @@ SWEEP_CONFIGS = {
     "hybrid-rerank": DEFAULT_CONFIG,
 }
 
-ls_client = Client()
+langfuse = get_client()
 
 async_openai_client = AsyncOpenAI()
 ragas_llm = llm_factory("gpt-5.4-mini", client=async_openai_client)
@@ -70,42 +71,43 @@ relevancy_scorer = AnswerRelevancy(llm=ragas_llm, embeddings=ragas_embeddings)
 
 
 # --- Retrieval evaluators -----------------------------------------------------
-# LangSmith calls each evaluator with the traced run (run.outputs = what
-# rag_pipeline returned) and the dataset example (example.outputs = ground truth).
+# Langfuse calls each evaluator with the task's return value (`output` = what
+# rag_pipeline returned) and the dataset item (`expected_output` = ground truth,
+# `metadata` = bucket/query_style). Return [] to record no score for this item.
 
 
-def _reference_ids(example):
-    return [str(x) for x in example.outputs.get("reference_context_ids") or []]
+def _reference_ids(expected_output):
+    return [str(x) for x in (expected_output or {}).get("reference_context_ids") or []]
 
 
-def _retrieved_ids(run):
-    return [str(x) for x in run.outputs["retrieved_context_ids"]]
+def _retrieved_ids(output):
+    return [str(x) for x in output["retrieved_context_ids"]]
 
 
-def eval_context_recall(run, example):
-    reference = set(_reference_ids(example))
+def eval_context_recall(*, output, expected_output, **kwargs):
+    reference = set(_reference_ids(expected_output))
     if not reference:
-        return {"key": "context_recall", "score": None}
-    retrieved = set(_retrieved_ids(run))
-    return {"key": "context_recall", "score": len(reference & retrieved) / len(reference)}
+        return []
+    retrieved = set(_retrieved_ids(output))
+    return Evaluation(name="context_recall", value=len(reference & retrieved) / len(reference))
 
 
-def eval_hit_at_k(run, example):
-    reference = set(_reference_ids(example))
+def eval_hit_at_k(*, output, expected_output, **kwargs):
+    reference = set(_reference_ids(expected_output))
     if not reference:
-        return {"key": "hit_at_k", "score": None}
-    hit = any(rid in reference for rid in _retrieved_ids(run))
-    return {"key": "hit_at_k", "score": 1.0 if hit else 0.0}
+        return []
+    hit = any(rid in reference for rid in _retrieved_ids(output))
+    return Evaluation(name="hit_at_k", value=1.0 if hit else 0.0)
 
 
-def eval_mrr(run, example):
-    reference = set(_reference_ids(example))
+def eval_mrr(*, output, expected_output, **kwargs):
+    reference = set(_reference_ids(expected_output))
     if not reference:
-        return {"key": "mrr", "score": None}
-    for rank, rid in enumerate(_retrieved_ids(run), start=1):
+        return []
+    for rank, rid in enumerate(_retrieved_ids(output), start=1):
         if rid in reference:
-            return {"key": "mrr", "score": 1.0 / rank}
-    return {"key": "mrr", "score": 0.0}
+            return Evaluation(name="mrr", value=1.0 / rank)
+    return Evaluation(name="mrr", value=0.0)
 
 
 _OPS = {
@@ -116,17 +118,17 @@ _OPS = {
 }
 
 
-def eval_constraint_satisfaction(run, example):
+def eval_constraint_satisfaction(*, output, expected_output, **kwargs):
     """Fraction of retrieved recipes whose payload satisfies all constraints.
 
     A missing payload value counts as a violation (we can't verify it).
     """
-    constraints = example.outputs.get("constraints") or []
+    constraints = (expected_output or {}).get("constraints") or []
     if not constraints:
-        return {"key": "constraint_satisfaction", "score": None}
-    payloads = run.outputs.get("retrieved_payloads") or []
+        return []
+    payloads = output.get("retrieved_payloads") or []
     if not payloads:
-        return {"key": "constraint_satisfaction", "score": 0.0}
+        return Evaluation(name="constraint_satisfaction", value=0.0)
 
     def satisfies(payload):
         for c in constraints:
@@ -136,31 +138,31 @@ def eval_constraint_satisfaction(run, example):
         return True
 
     score = sum(satisfies(p) for p in payloads) / len(payloads)
-    return {"key": "constraint_satisfaction", "score": score}
+    return Evaluation(name="constraint_satisfaction", value=score)
 
 
 # --- Generation evaluators (RAGAS) ---------------------------------------------
 
 
-async def eval_faithfulness(run, example):
+async def eval_faithfulness(*, output, metadata, **kwargs):
     # RAGAS faithfulness punishes honest refusals ("no match, closest are...")
     # as unsupported claims, so it doesn't apply to the unanswerable bucket.
-    if (example.metadata or {}).get("bucket") == "unanswerable":
-        return {"key": "faithfulness", "score": None}
+    if (metadata or {}).get("bucket") == "unanswerable":
+        return []
     result = await faithfulness_scorer.ascore(
-        user_input=run.outputs["question"],
-        response=run.outputs["answer"],
-        retrieved_contexts=run.outputs["retrieved_context"],
+        user_input=output["question"],
+        response=output["answer"],
+        retrieved_contexts=output["retrieved_context"],
     )
-    return {"key": "faithfulness", "score": result.value}
+    return Evaluation(name="faithfulness", value=result.value)
 
 
-async def eval_response_relevancy(run, example):
+async def eval_response_relevancy(*, output, **kwargs):
     result = await relevancy_scorer.ascore(
-        user_input=run.outputs["question"],
-        response=run.outputs["answer"],
+        user_input=output["question"],
+        response=output["answer"],
     )
-    return {"key": "response_relevancy", "score": result.value}
+    return Evaluation(name="response_relevancy", value=result.value)
 
 
 # --- Refusal evaluator (unanswerable bucket) -------------------------------------
@@ -171,9 +173,9 @@ class DeclineJudgment(BaseModel):
     declined: bool
 
 
-async def eval_correctly_declined(run, example):
-    if (example.metadata or {}).get("bucket") != "unanswerable":
-        return {"key": "correctly_declined", "score": None}
+async def eval_correctly_declined(*, output, metadata, **kwargs):
+    if (metadata or {}).get("bucket") != "unanswerable":
+        return []
     completion = await async_openai_client.chat.completions.parse(
         model="gpt-5.4-mini",
         messages=[
@@ -183,19 +185,19 @@ async def eval_correctly_declined(run, example):
                 "content": render_prompt(
                     PROMPTS_DIR,
                     "decline_judge_user",
-                    question=run.outputs["question"],
-                    answer=run.outputs["answer"],
+                    question=output["question"],
+                    answer=output["answer"],
                 ),
             },
         ],
         response_format=DeclineJudgment,
     )
     judgment = completion.choices[0].message.parsed
-    return {
-        "key": "correctly_declined",
-        "score": 1.0 if judgment.declined else 0.0,
-        "comment": judgment.reasoning,
-    }
+    return Evaluation(
+        name="correctly_declined",
+        value=1.0 if judgment.declined else 0.0,
+        comment=judgment.reasoning,
+    )
 
 
 # --- Experiment ----------------------------------------------------------------
@@ -207,10 +209,12 @@ RETRIEVAL_EVALUATORS = [eval_context_recall, eval_hit_at_k, eval_mrr, eval_const
 GENERATION_EVALUATORS = [eval_faithfulness, eval_response_relevancy, eval_correctly_declined]
 
 
-async def run_one(name: str, cfg: dict, evaluators: list, data):
-    async def target(inputs: dict) -> dict:
+def make_task(cfg: dict):
+    def task(*, item, **kwargs):
+        # item is a DatasetItem (hosted run) or a plain dict (local smoke data)
+        inp = item.input if hasattr(item, "input") else item["input"]
         return rag_pipeline(
-            inputs["question"],
+            inp["question"],
             k=cfg["k"],
             candidates=cfg["candidates"],
             collection_name=EVAL_COLLECTION_NAME,
@@ -218,48 +222,67 @@ async def run_one(name: str, cfg: dict, evaluators: list, data):
             use_rerank=cfg["rerank"],
         )
 
-    results = await ls_client.aevaluate(
-        target,
-        data=data,
-        evaluators=evaluators,
-        experiment_prefix=f"ragu-{name}",
-    )
-    df = results.to_pandas()
-    means = df[[c for c in df.columns if c.startswith("feedback.")]].mean(numeric_only=True)
-    print(f"\n[{name}] mean scores:")
-    print(means.to_string())
+    return task
+
+
+def means_from_result(result) -> dict:
+    vals = defaultdict(list)
+    for ir in result.item_results:
+        for ev in ir.evaluations:
+            if ev.value is not None:
+                vals[ev.name].append(ev.value)
+    return {name: sum(v) / len(v) for name, v in vals.items()}
+
+
+def run_one(name: str, cfg: dict, evaluators: list, dataset=None, data=None):
+    task = make_task(cfg)
+    if dataset is not None:
+        result = dataset.run_experiment(name=f"ragu-{name}", task=task, evaluators=evaluators)
+    else:
+        result = langfuse.run_experiment(name=f"ragu-{name}", data=data, task=task, evaluators=evaluators)
+
+    means = means_from_result(result)
+    print(f"\n[{name}] mean scores  ({result.dataset_run_url or 'local run'}):")
+    for metric, value in means.items():
+        print(f"  {metric:24} {value:.3f}")
     return means
 
 
-def smoke_examples():
-    dataset = ls_client.read_dataset(dataset_name=DATASET_NAME)
-    examples = list(ls_client.list_examples(dataset_id=dataset.id))
+def smoke_data(dataset) -> list:
+    items = list(dataset.items)
     # 2 gold-id + 1 constraint + 1 unanswerable exercise every evaluator.
-    with_gold = [e for e in examples if (e.outputs or {}).get("reference_context_ids")]
-    constraint = [e for e in examples if (e.outputs or {}).get("constraints")]
-    unanswerable = [e for e in examples if (e.metadata or {}).get("bucket") == "unanswerable"]
-    return with_gold[:2] + constraint[:1] + unanswerable[:1]
+    with_gold = [it for it in items if (it.expected_output or {}).get("reference_context_ids")]
+    constraint = [it for it in items if (it.expected_output or {}).get("constraints")]
+    unanswerable = [it for it in items if (it.metadata or {}).get("bucket") == "unanswerable"]
+    picked = with_gold[:2] + constraint[:1] + unanswerable[:1]
+    return [
+        {"input": it.input, "expected_output": it.expected_output, "metadata": it.metadata}
+        for it in picked
+    ]
 
 
-async def run_experiment(smoke: bool, sweep: bool, config: str | None = None):
-    data = smoke_examples() if smoke else DATASET_NAME
+def run_experiment(smoke: bool, sweep: bool, config: str | None = None):
+    dataset = langfuse.get_dataset(DATASET_NAME)
+    src = {"data": smoke_data(dataset)} if smoke else {"dataset": dataset}
     suffix = "-smoke" if smoke else ""
 
     if config:
-        await run_one(f"sweep-{config}{suffix}", SWEEP_CONFIGS[config], RETRIEVAL_EVALUATORS, data)
+        run_one(f"sweep-{config}{suffix}", SWEEP_CONFIGS[config], RETRIEVAL_EVALUATORS, **src)
     elif sweep:
         means = {}
         for name, cfg in SWEEP_CONFIGS.items():
-            means[name] = await run_one(f"sweep-{name}{suffix}", cfg, RETRIEVAL_EVALUATORS, data)
+            means[name] = run_one(f"sweep-{name}{suffix}", cfg, RETRIEVAL_EVALUATORS, **src)
         print("\n=== sweep comparison ===")
         print(pd.DataFrame(means).T.to_string())
     else:
-        await run_one(
+        run_one(
             f"baseline{suffix}",
             DEFAULT_CONFIG,
             RETRIEVAL_EVALUATORS + GENERATION_EVALUATORS,
-            data,
+            **src,
         )
+
+    langfuse.flush()  # short-lived script: flush before exit or scores are lost
 
 
 def main():
@@ -268,7 +291,7 @@ def main():
     parser.add_argument("--sweep", action="store_true", help="hybrid x rerank config sweep, retrieval metrics only")
     parser.add_argument("--config", choices=list(SWEEP_CONFIGS), help="run a single sweep config (retrieval metrics only)")
     args = parser.parse_args()
-    asyncio.run(run_experiment(smoke=args.smoke, sweep=args.sweep, config=args.config))
+    run_experiment(smoke=args.smoke, sweep=args.sweep, config=args.config)
 
 
 if __name__ == "__main__":

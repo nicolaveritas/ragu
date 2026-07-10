@@ -1,75 +1,168 @@
-# Cheatsheet — Evals RAG
+# Evals — RAGù
 
-Vocabulary of the concepts used in this project's evals, with concrete
-references to how we use them (dataset `ragu-evaluation-dataset`, script
-`evals/eval_retriever.py`, notebook `06-rag-eval-dataset.ipynb`).
+What we measure when we score the recipe RAG pipeline, and what each number
+actually means. Two levels per metric: **In plain words** (anyone can read it)
+and **Under the hood** (the exact definition + gotchas).
 
-## LangSmith objects
+Everything here is scored against the dataset **`ragu-evaluation-dataset-large`**
+(33 questions; source of truth `data/eval_dataset_large.jsonl`, built in
+`notebooks/10-rag-eval-dataset-large.ipynb`) by `evals/eval_retriever.py`, and
+tracked in **Langfuse**. Glossary of the moving parts is at the bottom.
+
+---
+
+## The metrics we track
+
+Three families: **retrieval** (cheap, exact, no LLM), **generation** (an LLM
+judges the written answer), and one **refusal** check.
+
+### Retrieval metrics — deterministic, no LLM
+
+They score the top-`k` retrieved recipes *before* the answer is written. No LLM,
+so they're cheap, exact and repeatable — these run in **every** experiment
+(baseline *and* the retriever sweep).
+
+#### `context_recall`
+**In plain words:** Of all the recipes that *should* have come up for this
+question, what fraction did the search actually find?
+
+**Under the hood:** `|gold ∩ retrieved| / |gold|` — the labelled correct ids
+(`reference_context_ids`) intersected with the top-`k` retrieved ids, over the
+number of correct ids. It's *recall*: it punishes misses but ignores ordering
+and ignores irrelevant extras in the top-k. `1.0` = every correct recipe made it
+into the top-5. Runs only on questions that *have* gold ids (`single`/`multi`);
+skipped for `unanswerable` and `constraint`.
+
+#### `hit@k`
+**In plain words:** Did the search surface *at least one* correct recipe in the
+top few results?
+
+**Under the hood:** `1.0` if any top-`k` id is in the gold set, else `0.0`. A
+lenient floor — one hit is enough, no matter how many golds exist or where they
+rank. It's the metric that matters when the user only needs one good answer.
+Same applicability as `context_recall` (`single`/`multi`).
+
+#### `mrr` (Mean Reciprocal Rank)
+**In plain words:** How high up the list did the *first* correct recipe appear?
+
+**Under the hood:** `1 / rank` of the first gold id in the retrieved list (rank 1
+→ `1.0`, rank 3 → `0.33`, none → `0.0`). Unlike recall/hit@k it *is* sensitive to
+ordering — so this is the number re-ranking is supposed to move. `single`/`multi`
+only.
+
+> We deliberately don't track classic **precision@k** (`gold found / k`): with
+> one gold recipe and `k=5` the ceiling is `0.2`, so the average just blends
+> non-comparable buckets. `hit@k` and `mrr` say the same thing more readably.
+
+#### `constraint_satisfaction`
+**In plain words:** Of the recipes the system suggested, how many actually obey
+the numeric limit the user asked for (e.g. "under 300 calories")?
+
+**Under the hood:** fraction of the retrieved recipes whose Qdrant payload
+satisfies *every* constraint (e.g. `{field: Calories, op: lt, value: 300}`). A
+missing payload value counts as a violation (can't verify it → fail closed);
+empty retrieval scores `0`. Effectively precision@k against the implicit "meets
+the constraint" gold. Runs only on the `constraint` bucket. (We check the payload
+directly rather than the precomputed `constraint_matching_ids` — it's equivalent
+and doesn't depend on the id label being complete.)
+
+### Generation metrics — LLM-as-judge (RAGAS)
+
+They score the **final written answer**, not the retrieval. An LLM judge
+(`gpt-5.4-mini` via RAGAS) reads the answer/context and assigns the score:
+powerful for things you can't compute deterministically, but **noisy** —
+spot-check the judge's reasoning in the trace. These run **only in the baseline**
+(the sweep changes the retriever, not the generator, so re-judging every config
+would just re-measure the same generator).
+
+#### `faithfulness`
+**In plain words:** Is everything the answer claims actually backed by the
+retrieved recipes, or did the model make things up?
+
+**Under the hood:** RAGAS breaks the answer into atomic claims and checks each
+against the retrieved context; the score is the supported fraction (a
+hallucination measure). **Skipped for `unanswerable`**: an honest refusal ("no
+match; closest are…") decomposes into unsupported claims and scores near `0` even
+when it's exactly the right behaviour. Runs on `single`/`multi`/`constraint`.
+
+#### `response_relevancy`
+**In plain words:** Does the answer actually address the question that was asked?
+
+**Under the hood:** RAGAS generates questions *from* the answer and measures their
+similarity to the real question (embedding cosine) — high when the answer is
+on-topic, low when it rambles or dodges. It judges the answer text, so bad
+retrieval only lowers it indirectly (if the answer ends up off-topic). Runs on
+every bucket.
+
+### Refusal metric — LLM-as-judge
+
+#### `correctly_declined`
+**In plain words:** When no recipe could possibly match, did the system honestly
+say so instead of pretending?
+
+**Under the hood:** a binary judgment from our own `gpt-5.4-mini` + the
+`decline_judge` prompt — `1.0` if the answer clearly states that no available
+recipe matches, else `0.0`. Offering *labelled* alternatives is fine; presenting
+a recipe as if it fits = `0`. It's the mirror of faithfulness's skip: the metric
+that owns the `unanswerable` bucket. The judge's reasoning is saved to the score
+comment. Runs only on `unanswerable`.
+
+---
+
+## Which metrics run on which question
+
+Each metric applies only to the buckets where it makes sense; elsewhere the
+evaluator returns nothing and Langfuse shows an **empty cell** (skipped, *not* a
+failure or a zero).
+
+| Bucket (n) | recall / hit@k / mrr | constraint_satisfaction | faithfulness | response_relevancy | correctly_declined |
+|---|:---:|:---:|:---:|:---:|:---:|
+| `single` (11)      | ✓ | – | ✓ | ✓ | – |
+| `multi` (3)        | ✓ | – | ✓ | ✓ | – |
+| `constraint` (12)  | – | ✓ | ✓ | ✓ | – |
+| `unanswerable` (7) | – | – | – | ✓ | ✓ |
+
+---
+
+## Glossary & concepts (reference)
+
+### Langfuse objects
 
 | Term | What it is |
 |---|---|
-| **Dataset** | The collection of test questions with their ground truth. Ours: 60 LLM questions + 12 constraint. |
-| **Example** | A row of the dataset: `inputs` (the question), `outputs` (the ground truth), `metadata` (labels for filtering: `bucket`, `query_style`). |
-| **Experiment** | A complete run of the pipeline on the whole dataset + the scores. One experiment = one version of the pipeline (dense, hybrid, hybrid+filters...). |
-| **Run / trace** | The execution of the pipeline on a single example: query, retrieved recipes, prompt, answer. You open it by clicking the row. |
-| **Feedback** | The scores attached to a run, one per evaluator. The columns of the table. |
-| **Evaluator** | Function `(run, example) -> score`. It receives what the pipeline produced and the ground truth, and returns a number — or `None` to say "I don't apply to this row". |
-| **Compare view** | You select 2+ experiments on the same dataset and see row by row where the scores change. It's the tool for answering "did hybrid search improve things?". |
+| **Dataset** | The collection of test questions + their ground truth. Ours: `ragu-evaluation-dataset-large`, 33 items (21 LLM-generated + 12 constraint). Source of truth is `data/eval_dataset_large.jsonl`; `evals/upload_dataset.py` pushes it to Langfuse (idempotent upsert by question hash). |
+| **Dataset item** | One row: `input` (the question), `expected_output` (the ground truth), `metadata` (labels for filtering: `bucket`, `query_style`). |
+| **Experiment** (dataset run) | One full run of the pipeline over the dataset + its scores. One experiment = one pipeline config (dense, hybrid, hybrid+rerank…). Created by `dataset.run_experiment(name, task, evaluators)`. |
+| **Trace** | The execution on a single item: query → retrieved recipes → prompt → answer. Click a row to open it. |
+| **Score** | A metric value attached to a trace/run — one per evaluator. The columns of the results table. |
+| **Evaluator** | Function `(*, input, output, expected_output, metadata) -> Evaluation(name, value, comment)`. Returns `[]` to say "I don't apply to this row" (records no score). |
+| **Compare** | Select 2+ experiments on the *same* dataset and see per-row score deltas — the tool for "did hybrid search improve things?". |
 
-## Structure of our dataset
-
-| Term | What it is |
-|---|---|
-| **Ground truth / golden (set)** | The expected correct answer. For retrieval: the ids of the correct recipes (`reference_context_ids`). "Golden" and "ground truth" are synonyms. |
-| **Bucket** | Category of the question, in `metadata.bucket`: `single` (1 correct recipe), `multi` (multiple recipes), `unanswerable` (none: the system must say "I have nothing"), `constraint` (numeric constraint, gold computed from pandas). |
-| **query_style** | How the question is phrased: `keyword` ("vegan cookies no eggs"), `natural` (full sentence), `detailed` (long multi-attribute request). It's used to understand on which styles a retriever performs better (BM25 should help with keywords). |
-| **Constraint** | Machine-readable numeric constraint in the outputs, e.g. `{"field": "Calories", "op": "lt", "value": 300}`. It is the ground truth itself for the constraint bucket. |
-| **constraint_matching_ids** | The ids that satisfy the constraint, precomputed by pandas. Saved only for inspection: no metric reads them, because verifying the constraint on the payload is equivalent to verifying membership in this list. |
-
-## Retrieval metrics (deterministic, without LLM)
-
-They evaluate the `k=5` retrieved recipes, before the generator writes the answer.
-They apply only to rows with golden ids (they skip `unanswerable` and `constraint`).
-
-| Metric | Formula | Answers |
-|---|---|---|
-| **context_recall** | golden found / total golden | "Of the correct recipes, how many are in the top-5?" |
-| **hit@k (hit rate)** | 1 if at least one golden is in the top-5, otherwise 0 | "Is there at least one correct answer?" |
-| **MRR** (Mean Reciprocal Rank) | 1/position of the first golden (1st → 1.0, 3rd → 0.33, absent → 0) | "Is the correct answer near the top or the bottom?" |
-| **constraint_satisfaction** | retrieved recipes that respect the constraint / k | "Does everything you proposed respect the numeric constraint?" It's equivalent to a precision@k against the implicit golden. Only bucket `constraint`. |
-
-Why there's no classic **precision** (`golden found / k`): with only 1 golden
-recipe and k=5 the theoretical maximum is 0.2, so the aggregate number mixes
-non-comparable buckets. hit@k and MRR measure the same thing in a readable way.
-
-## Generation metrics (LLM-as-judge)
-
-They evaluate the **final generated answer**, not the retrieval. An LLM ("judge",
-for us gpt-5.4-mini via RAGAS) reads the answer/context and assigns the score:
-useful for properties that can't be computed deterministically, but noisy — always
-verify the judge's reasoning in the trace on a sample basis.
-
-| Metric | Answers |
-|---|---|
-| **faithfulness** | "Are the claims in the answer supported by the retrieved recipes, or did the model make things up?" (measures hallucinations) Skips the `unanswerable` bucket: an honest refusal ("no match, closest are...") decomposes into unsupported claims and scores near 0 even when it's the right answer. |
-| **response_relevancy** | "Does the answer address the question asked?" It judges the text of the answer: a wrong retrieval lowers it only indirectly (if the final answer ends up off-topic). |
-| **correctly_declined** | Only bucket `unanswerable` (the mirror of faithfulness skipping it): "Did the answer clearly say no available recipe matches?" Binary. Alternatives are allowed if labeled as such; presenting a recipe as if it fits = 0. The judge's reasoning lands in the feedback comment. |
-
-## Retrieval concepts
+### Our dataset structure
 
 | Term | What it is |
 |---|---|
-| **Dense embedding / semantic search** | Text → dense vector (OpenAI text-embedding-3-small); closeness in the vector ≈ closeness in meaning. Finds "porridge" for "light breakfast". Our current only retriever. |
-| **Sparse embedding / BM25 / keyword search** | Lexical match weighted by term rarity. Finds the exact, rare terms that dense "blurs" (ingredient names, acronyms). No notion of meaning nor of `<`/`>`. |
-| **Hybrid search** | Dense + sparse together, results merged (typically with RRF, reciprocal rank fusion). Covers both meaning and exact terms. |
-| **Payload / metadata filter** | Exact filter on Qdrant's structured columns (`Calories < 500`). A hard guarantee that no retriever can give. Composable with any vector search. |
-| **Re-ranking** | Second pass: a more expensive model reorders the retrieved top-N to put them in a better order. Improves MRR/precision, not recall (it doesn't add candidates). |
-| **k / top-k** | How many results you ask the retriever for (5 for us). Raising k helps recall and dilutes precision. |
-| **Eval sample collection** | `Recipes-collection-01-eval-sample-100`: the 100 recipes of the sample in a dedicated collection, so that every golden is guaranteed to be in the index (a missing golden would look like a retriever error: false negative). |
+| **Ground truth / golden** | The expected correct answer. For retrieval: the ids of the correct recipes (`reference_context_ids`). Only `single`/`multi` questions have these. "Golden" and "ground truth" are synonyms. |
+| **Bucket** | Category of the question (`metadata.bucket`): `single` (1 correct recipe), `multi` (several), `unanswerable` (none — the system must decline), `constraint` (numeric constraint, gold computed with pandas). |
+| **query_style** | How the question is phrased (`metadata.query_style`): `keyword` ("vegan cookies no eggs"), `natural` (full sentence), `detailed` (long multi-attribute request). Used to see which styles a retriever handles better (BM25 should help keywords). |
+| **Constraint** | Machine-readable numeric constraint in `expected_output`, e.g. `{"field": "Calories", "op": "lt", "value": 300}`. It *is* the ground truth for the `constraint` bucket. |
+| **constraint_matching_ids** | The ids that satisfy the constraint, precomputed by pandas. Kept for inspection only — no metric reads them (checking the payload directly is equivalent). |
 
-## How to read an experiment
+### Retrieval concepts
 
-1. Dataset → **Experiments** tab → click the experiment: one row per question, one column per metric (averages at the top). Empty cell = evaluator skipped for that row, not an error.
-2. **Aggregate averages are misleading**: filter/group by `metadata.bucket` and `query_style` before drawing conclusions (e.g. low relevancy might come entirely from the unanswerable bucket).
-3. **Filter by low score** (e.g. `hit_at_k = 0`) and open the traces: that's where you understand *why* it got it wrong.
-4. To compare pipeline versions: same dataset, one experiment per version, **Compare**. Never compare experiments made on regenerated datasets (the example ids change).
+| Term | What it is |
+|---|---|
+| **Dense embedding / semantic search** | Text → dense vector (OpenAI `text-embedding-3-small`); closeness in vector space ≈ closeness in meaning. Finds "porridge" for "light breakfast". |
+| **Sparse embedding / BM25 / keyword search** | Lexical match weighted by term rarity. Finds exact, rare terms that dense "blurs" (ingredient names, acronyms). No notion of meaning nor of `<`/`>`. |
+| **Hybrid search** | Dense + sparse together, results merged (typically RRF, reciprocal rank fusion). Covers both meaning and exact terms. |
+| **Payload / metadata filter** | Exact filter on Qdrant's structured fields (`Calories < 500`). A hard guarantee no vector search can give. Composable with any retriever. |
+| **Re-ranking** | Second pass: a more expensive model reorders the retrieved top-N. Improves `mrr`/precision, *not* recall (it adds no candidates). |
+| **k / top-k** | How many results you ask the retriever for (5 for us). Higher `k` helps recall, dilutes precision. |
+| **Eval collection** | We eval against the **full** collection `Recipes-collection-01-hybrid`. The gold labels are complete over the whole corpus (relevance-swept + verified), so no dedicated sample collection is needed. |
+
+### How to read an experiment
+
+1. Dataset → **Runs** → open a run: one row per question, one column per metric (averages up top). **Empty cell = evaluator skipped for that row**, not an error or a zero.
+2. **Aggregate averages are misleading**: group by `metadata.bucket` / `query_style` before concluding (e.g. a low `response_relevancy` might come entirely from the `unanswerable` bucket).
+3. **Filter by low score** (e.g. `hit@k = 0`) and open the traces — that's where you see *why* it got it wrong.
+4. To compare pipeline versions: same dataset, one experiment per version, **Compare**. Never compare experiments run on regenerated datasets (item ids change).
