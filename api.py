@@ -1,19 +1,20 @@
-"""FastAPI service exposing the ragu RAG pipeline. Run: uvicorn api:app --reload"""
+"""FastAPI service exposing the ragu agent. Run: uvicorn api:app --reload"""
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from ragu.pipeline import rag_pipeline
+from ragu.agent import run_agent
+from ragu.retrieval import fetch_recipes_by_ids
 
 app = FastAPI(title="Ragù API")
 
 
 class Query(BaseModel):
     question: str
-    k: int = 5
 
 
 @app.post("/chat")
 def chat(q: Query):
-    # ponytail: return the pipeline dict as-is; add a response_model when the contract needs freezing
-    return rag_pipeline(q.question, k=q.k)
+    result = run_agent(q.question)
+    recipes = fetch_recipes_by_ids([r["id"] for r in result["references"]])
+    return {"question": result["question"], "answer": result["answer"], "recipes": recipes}

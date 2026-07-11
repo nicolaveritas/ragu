@@ -31,7 +31,7 @@ The pipeline is served by a FastAPI backend; the Streamlit UI is a client that t
 ./run.sh
 ```
 
-This starts Qdrant (Docker) and runs the API (:8000, docs at `/docs`) and UI (:8501) with hot reload; Ctrl-C stops the app. Set `RAGU_API_URL` if the API lives elsewhere.
+This starts Qdrant + Langfuse (Docker) and runs the API (:8000, docs at `/docs`) and UI (:8501) with hot reload; Ctrl-C stops the local app, `docker compose down` the containers. Set `RAGU_API_URL` if the API lives elsewhere.
 
 ## Status
 

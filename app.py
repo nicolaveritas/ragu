@@ -13,10 +13,6 @@ if "messages" not in st.session_state:
     st.session_state.messages = []  # list of {role, content}
 if "recipes" not in st.session_state:
     st.session_state.recipes = []
-if "constraints" not in st.session_state:
-    st.session_state.constraints = []
-if "filter_relaxed" not in st.session_state:
-    st.session_state.filter_relaxed = False
 
 
 def recipe_card(r):
@@ -58,16 +54,9 @@ def recipe_card(r):
 
 
 with st.sidebar:
-    st.subheader("Retrieved recipes")
-    if st.session_state.constraints:
-        chips = " ".join(
-            f"`{c['field']} {c['op']} {c['value']:g}`" for c in st.session_state.constraints
-        )
-        st.caption(f"Detected constraints: {chips}")
-    if st.session_state.filter_relaxed:
-        st.warning("No recipe matched all your limits — showing the closest matches.")
+    st.subheader("Recipes used")
     if not st.session_state.recipes:
-        st.caption("Ask something to see matching recipes here.")
+        st.caption("Ask something to see the recipes behind the answer here.")
     for r in st.session_state.recipes:
         recipe_card(r)
 
@@ -89,6 +78,4 @@ if prompt := st.chat_input("e.g. high-protein dinner under 600 kcal, ready in 30
         st.markdown(result["answer"])
     st.session_state.messages.append({"role": "assistant", "content": result["answer"]})
     st.session_state.recipes = result["recipes"]
-    st.session_state.constraints = result["constraints"]
-    st.session_state.filter_relaxed = result["filter_relaxed"]
     st.rerun()
