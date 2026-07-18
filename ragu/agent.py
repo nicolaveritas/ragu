@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from langgraph.prebuilt import ToolNode
 
 from ragu.prompt_loader import render_prompt
-from ragu.tools import search_recipes
+from ragu.tools import search_recipes, search_reviews
 
 from langfuse import observe, propagate_attributes
 from langfuse.langchain import CallbackHandler
@@ -51,7 +51,7 @@ agent_llm = ChatOpenAI(
     model="gpt-5.4-mini",
     reasoning_effort="low",
     use_responses_api=True,
-).bind_tools([search_recipes, FinalResponse], tool_choice="required")
+).bind_tools([search_recipes, search_reviews, FinalResponse], tool_choice="required")
 
 def agent_node(state: State) -> dict:
     prompt = render_prompt(PROMPTS_DIR, "agent_prompt")
@@ -124,7 +124,7 @@ def intent_router_conditional_edges(state: State) -> str:
 
 builder = (
     StateGraph(State)
-    .add_node("tool_node", ToolNode([search_recipes]))
+    .add_node("tool_node", ToolNode([search_recipes, search_reviews]))
     .add_node("intent_router_node", intent_router_node)
     .add_node("agent_node", agent_node)
     .add_edge(START, "intent_router_node")

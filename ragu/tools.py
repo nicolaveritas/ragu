@@ -1,5 +1,5 @@
 from langchain_core.tools import tool
-from ragu.retrieval import format_blocks, rerank, retrieve_data
+from ragu.retrieval import format_blocks, format_reviews, rerank, retrieve_data, retrieve_reviews
 
 @tool
 def search_recipes(query: str, top_k: int = 5) -> str:
@@ -28,3 +28,26 @@ def search_recipes(query: str, top_k: int = 5) -> str:
             "showing the closest matches instead.\n\n" + text
         )
     return text
+
+
+@tool
+def search_reviews(recipe_ids: list[int], query: str, top_k: int = 5) -> str:
+    """Search user reviews for specific recipes.
+
+    Call this AFTER `search_recipes`, to find out what people say about recipes
+    it returned (taste, texture, difficulty, ingredient swaps, whether it works
+    as written). Reviews are searched only within the recipes you name.
+
+    Args:
+        recipe_ids: The recipe `id` values from `search_recipes` results whose
+            reviews you want. Pass one or several.
+        query: What to look for in the reviews (e.g. "too sweet", "gluten-free
+            substitutions", "kids liked it"). Reviews are ranked by relevance to
+            this.
+        top_k: Number of reviews to return across all the given recipes.
+
+    Returns:
+        One line per review, tagged with its recipe id and star rating.
+    """
+    reviews = retrieve_reviews(query, recipe_ids=recipe_ids, k=top_k)
+    return format_reviews(reviews)

@@ -12,14 +12,22 @@ from ragu.retrieval.recipes import (
     format_blocks,
     retrieve_data,
 )
+from ragu.retrieval.reviews import (
+    REVIEWS_COLLECTION,
+    format_reviews,
+    retrieve_reviews,
+)
 
 __all__ = [
     "PROMPTS_DIR",
     "RERANK_MODEL",
     "RECIPES_COLLECTION",
+    "REVIEWS_COLLECTION",
     "get_embedding",
     "rerank",
     "retrieve_data",
     "fetch_recipes_by_ids",
     "format_blocks",
+    "retrieve_reviews",
+    "format_reviews",
 ]
