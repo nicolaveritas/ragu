@@ -6,8 +6,8 @@ baseline (evals/eval_retriever.py). Delete once that eval migrates to the agent.
 """
 
 from ragu.retrieval import (  # noqa: F401  (RERANK_MODEL re-exported for the eval)
-    DEFAULT_COLLECTION,
     PROMPTS_DIR,
+    RECIPES_COLLECTION,
     RERANK_MODEL,
     format_blocks,
     rerank,
@@ -45,7 +45,7 @@ def generate_answer(system_prompt, question):
 
 
 @observe(name="rag_pipeline")
-def rag_pipeline(question, k=5, candidates=20, collection_name=DEFAULT_COLLECTION, hybrid=True, use_rerank=True):
+def rag_pipeline(question, k=5, candidates=20, collection_name=RECIPES_COLLECTION, hybrid=True, use_rerank=True):
     retrieved = retrieve_data(question, candidates, collection_name, hybrid=hybrid)
     filter_relaxed = retrieved["filter_relaxed"]
     # rerank picks + reorders the best k of `candidates`; without it, fusion top-k as-is

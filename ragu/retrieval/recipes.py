@@ -1,36 +1,29 @@
-"""
-Recipe retrieval: query understanding -> filtered hybrid search -> rerank.
+"""Recipe retrieval: query understanding -> filtered hybrid search -> payload shaping.
 
-Shared by the agent's search tool (agent.py) and by fetch-by-id lookups (api.py).
-The legacy linear generation pipeline lives in pipeline.py and imports from here.
+Public API (bottom of file):
+    retrieve_data        - hybrid search with numeric-constraint filtering + fallback
+    fetch_recipes_by_ids - full recipe cards for known ids (api.py card lookups)
+    format_blocks        - render recipe dicts into the text blocks the LLM reads
+
+Reranking is generic and lives in _shared.rerank. This module owns everything
+recipe-specific: the constraint model, the Qdrant query building, payload shaping.
+Ordered definition-before-use: models, then _private helpers, then public API.
 """
 
-import os
-from pathlib import Path
 from typing import Literal
 
 import instructor
 from langfuse import observe
-from langfuse.openai import openai  # drop-in replacement: auto-traces every OpenAI call
 from pydantic import BaseModel, Field
-from qdrant_client import QdrantClient, models
-from flashrank import Ranker, RerankRequest
+from qdrant_client import models
 
 from ragu.prompt_loader import render_prompt
+from ragu.retrieval._shared import PROMPTS_DIR, get_embedding, qdrant_client
 
-PROMPTS_DIR = Path(__file__).parent / "prompts"
-DEFAULT_COLLECTION = "Recipes-collection-01-hybrid"
-
-qdrant_client = QdrantClient(url=os.getenv("QDRANT_URL", "http://localhost:6333"))
-RERANK_MODEL = "ms-marco-MiniLM-L-12-v2"
-ranker = Ranker(model_name=RERANK_MODEL)
+RECIPES_COLLECTION = "Recipes-collection-01-hybrid"
 
 
-def get_embedding(text, model="text-embedding-3-small"):
-    # langfuse.openai auto-logs an embedding generation with model + token usage;
-    # `name` just labels it in the trace. No manual usage bookkeeping needed.
-    response = openai.embeddings.create(input=text, model=model, name="embed_query")
-    return response.data[0].embedding
+# ============================ Query-understanding model =======================
 
 
 class Constraint(BaseModel):
@@ -64,18 +57,21 @@ class ExtractedConstraints(BaseModel):
     )
 
 
-extractor_client = instructor.from_provider(
+# =============================== Private helpers ==============================
+
+
+_extractor_client = instructor.from_provider(
     "openai/gpt-5.4-nano",
     mode=instructor.Mode.RESPONSES_TOOLS,
 )
 
 
 @observe(name="extract_constraints")
-def extract_constraints(query: str) -> ExtractedConstraints:
+def _extract_constraints(query: str) -> ExtractedConstraints:
     # instructor builds its client from the langfuse-wrapped openai, so the
     # underlying Responses call is auto-traced as a nested generation (model +
     # tokens captured once). We just wrap it in a clearly-named span.
-    return extractor_client.create(
+    return _extractor_client.create(
         messages=[
             {"role": "system", "content": render_prompt(PROMPTS_DIR, "extract_constraints")},
             {"role": "user", "content": query},
@@ -85,7 +81,7 @@ def extract_constraints(query: str) -> ExtractedConstraints:
     )
 
 
-def build_qdrant_filter(constraints: list[Constraint]) -> models.Filter | None:
+def _build_qdrant_filter(constraints: list[Constraint]) -> models.Filter | None:
     if not constraints:
         return None
     return models.Filter(
@@ -96,7 +92,8 @@ def build_qdrant_filter(constraints: list[Constraint]) -> models.Filter | None:
     )
 
 
-def query_points_with_filter(query, qfilter, k=5, collection_name=DEFAULT_COLLECTION, hybrid=True):
+@observe(name="qdrant_search")
+def _query_points_with_filter(query, qfilter, k=5, collection_name=RECIPES_COLLECTION, hybrid=True):
     query_embedding = get_embedding(query)
     if not hybrid:  # dense-only: single vector query, no BM25 prefetch, no fusion
         return qdrant_client.query_points(
@@ -130,14 +127,14 @@ def query_points_with_filter(query, qfilter, k=5, collection_name=DEFAULT_COLLEC
     )
 
 
-def query_points_with_fallback(query, k=5, collection_name=DEFAULT_COLLECTION, hybrid=True):
-    extracted = extract_constraints(query)
-    qfilter = build_qdrant_filter(extracted.constraints)
+def _query_points_with_fallback(query, k=5, collection_name=RECIPES_COLLECTION, hybrid=True):
+    extracted = _extract_constraints(query)
+    qfilter = _build_qdrant_filter(extracted.constraints)
 
-    results = query_points_with_filter(query, qfilter, k, collection_name, hybrid)
+    results = _query_points_with_filter(query, qfilter, k, collection_name, hybrid)
     filter_relaxed = False
     if qfilter is not None and not results.points:
-        results = query_points_with_filter(query, None, k, collection_name, hybrid)
+        results = _query_points_with_filter(query, None, k, collection_name, hybrid)
         filter_relaxed = True
 
     return {
@@ -147,7 +144,7 @@ def query_points_with_fallback(query, k=5, collection_name=DEFAULT_COLLECTION, h
     }
 
 
-def payload_to_recipe(payload, score=None):
+def _payload_to_recipe(payload, score=None):
     images = payload.get("Images") or []
     return {
         "id": int(payload["RecipeId"]),
@@ -170,10 +167,13 @@ def payload_to_recipe(payload, score=None):
     }
 
 
+# ================================= Public API =================================
+
+
 @observe(as_type="retriever", name="retrieve_data")
-def retrieve_data(query, k=5, collection_name=DEFAULT_COLLECTION, hybrid=True):
-    out = query_points_with_fallback(query, k, collection_name, hybrid)
-    recipes = [payload_to_recipe(r.payload, score=r.score) for r in out["results"].points]
+def retrieve_data(query, k=5, collection_name=RECIPES_COLLECTION, hybrid=True):
+    out = _query_points_with_fallback(query, k, collection_name, hybrid)
+    recipes = [_payload_to_recipe(r.payload, score=r.score) for r in out["results"].points]
     return {
         "recipes": recipes,
         "constraints": [c.model_dump() for c in out["constraints"]],
@@ -181,7 +181,7 @@ def retrieve_data(query, k=5, collection_name=DEFAULT_COLLECTION, hybrid=True):
     }
 
 
-def fetch_recipes_by_ids(ids, collection_name=DEFAULT_COLLECTION):
+def fetch_recipes_by_ids(ids, collection_name=RECIPES_COLLECTION):
     """Full card payloads for recipe ids, in the given order (missing ids skipped).
 
     Point id == RecipeId (see notebook 09), so a single retrieve() suffices.
@@ -189,7 +189,7 @@ def fetch_recipes_by_ids(ids, collection_name=DEFAULT_COLLECTION):
     if not ids:
         return []
     records = qdrant_client.retrieve(collection_name=collection_name, ids=ids, with_payload=True)
-    by_id = {int(r.payload["RecipeId"]): payload_to_recipe(r.payload) for r in records}
+    by_id = {int(r.payload["RecipeId"]): _payload_to_recipe(r.payload) for r in records}
     return [by_id[i] for i in ids if i in by_id]
 
 
@@ -226,17 +226,3 @@ def format_blocks(retrieved, max_steps_chars=300):
             f"  steps: {steps}"
         )
     return blocks
-
-
-@observe(as_type="retriever", name="rerank")
-def rerank(query, recipes, top_n=5):
-    if not recipes:  # ponytail: ranker chokes on an empty/all-blank document list
-        return []
-    docs = [{"id": i, "text": r.get("text")} for i, r in enumerate(recipes)]
-    response = ranker.rerank(RerankRequest(query=query, passages=docs))
-    out = []
-    for result in response[:top_n]:
-        recipe = recipes[result["id"]]
-        recipe["score"] = result["score"]
-        out.append(recipe)
-    return out
