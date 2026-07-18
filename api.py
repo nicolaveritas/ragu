@@ -11,10 +11,11 @@ app = FastAPI(title="Ragù API")
 
 class Query(BaseModel):
     question: str
+    thread_id: str
 
 
 @app.post("/chat")
 def chat(q: Query):
-    result = run_agent(q.question)
+    result = run_agent(q.question, q.thread_id)
     recipes = fetch_recipes_by_ids([r["id"] for r in result["references"]])
     return {"question": result["question"], "answer": result["answer"], "recipes": recipes}

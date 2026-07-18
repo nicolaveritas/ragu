@@ -1,11 +1,13 @@
 import json
+import os
 from operator import add
 from pathlib import Path
 from typing import Annotated, Any
 import instructor
-from langchain_core.messages import AIMessage, HumanMessage, convert_to_openai_messages
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, convert_to_openai_messages
 from langchain_core.tools import tool
-from langchain_core.utils.function_calling import convert_to_openai_tool
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 from langgraph.prebuilt import ToolNode
@@ -13,13 +15,14 @@ from langgraph.prebuilt import ToolNode
 from ragu.retrieval import format_blocks, rerank, retrieve_data
 from ragu.prompt_loader import render_prompt
 
-from langfuse import observe
+from langfuse import observe, propagate_attributes
 from langfuse.langchain import CallbackHandler
-from langfuse.openai import openai
+
 
 langfuse_handler = CallbackHandler()
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
+CONNECTION_STRING = os.getenv("POSTGRES_CONNECTION_STRING")
 
 @tool
 def search_recipes(query: str, top_k: int = 5) -> str:
@@ -74,46 +77,28 @@ class State(BaseModel):
     references: list[RAGUsedContext] = []
 
 
-# OpenAI tool schemas: what bind_tools would have built from the docstrings/models
-AGENT_TOOLS = [convert_to_openai_tool(search_recipes), convert_to_openai_tool(FinalResponse)]
-
+agent_llm = ChatOpenAI(
+    model="gpt-5.4-mini",
+    reasoning_effort="low",
+    use_responses_api=True,
+).bind_tools([search_recipes, FinalResponse], tool_choice="required")
 
 def agent_node(state: State) -> dict:
     prompt = render_prompt(PROMPTS_DIR, "agent_prompt")
-    response = openai.chat.completions.create(
-        model="gpt-5.4-mini",
-        messages=[
-            {"role": "system", "content": prompt},
-            *convert_to_openai_messages(state.messages),
-        ],
-        tools=AGENT_TOOLS,
-        tool_choice="required",
-        reasoning_effort="none",
-        name="agent_llm",
-    )
-    msg = response.choices[0].message
-    # back to LangChain-land: ToolNode wants an AIMessage with parsed tool_calls
-    tool_calls = [
-        {
-            "name": tc.function.name,
-            "args": json.loads(tc.function.arguments),
-            "id": tc.id,
-            "type": "tool_call",
-        }
-        for tc in (msg.tool_calls or [])
-    ]
+    response = agent_llm.invoke([SystemMessage(content=prompt), *state.messages])
 
     final_answer = False
     answer = ""
     references = []
-    for tc in tool_calls:
+    for tc in response.tool_calls:
         if tc["name"] == "FinalResponse":
             final_answer = True
             answer = tc["args"]["answer"]
             references.extend(tc["args"]["references"])
 
+    message = AIMessage(content=answer) if final_answer else response
     return {
-        "messages": [AIMessage(content=msg.content or "", tool_calls=tool_calls)],
+        "messages": [message],
         "iteration": state.iteration + 1,
         "final_answer": final_answer,
         "answer": answer,
@@ -152,7 +137,7 @@ def intent_router_node(state: State) -> dict:
     response = intent_client.create(
         messages=[
             {"role": "system", "content": render_prompt(PROMPTS_DIR, "intent_router")},
-            *convert_to_openai_messages(state.messages),
+            *convert_to_openai_messages([state.messages[-1]]),
         ],
         reasoning={"effort": "none"},
         response_model=IntentRouterResponse,
@@ -167,7 +152,7 @@ def intent_router_conditional_edges(state: State) -> str:
         return "end"
 
 
-graph = (
+builder = (
     StateGraph(State)
     .add_node("tool_node", ToolNode([search_recipes]))
     .add_node("intent_router_node", intent_router_node)
@@ -190,17 +175,26 @@ graph = (
         }
     )
     .add_edge("tool_node", "agent_node")
-    .compile()
 )
 
 
 @observe(name="run_agent")
-def run_agent(question: str) -> dict:
+def run_agent(question: str, thread_id: str) -> dict:
     initial_state = {
         "messages": [HumanMessage(content=question)],
+        "iteration": 0,
     }
 
-    result = graph.invoke(initial_state, config={"callbacks": [langfuse_handler]})
+    with propagate_attributes(session_id=thread_id):
+        with PostgresSaver.from_conn_string(CONNECTION_STRING) as checkpointer:
+            graph = builder.compile(checkpointer=checkpointer)
+            result = graph.invoke(
+                initial_state, 
+                config={
+                    "callbacks": [langfuse_handler],
+                    "configurable": {"thread_id": thread_id}
+                }
+            )
 
     # Relevant question but the loop hit the iteration cap without a FinalResponse:
     # never hand the UI a blank bubble. (Off-topic path already carries the router's reply.)

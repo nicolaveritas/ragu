@@ -1,6 +1,7 @@
 """Streamlit chat UI for ragu: chat in the main area, retrieved recipes in the sidebar."""
 
 import os
+import uuid
 
 import httpx
 import streamlit as st
@@ -13,6 +14,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []  # list of {role, content}
 if "recipes" not in st.session_state:
     st.session_state.recipes = []
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = uuid.uuid4().hex  # one conversation per browser session
 
 
 def recipe_card(r):
@@ -71,7 +74,11 @@ if prompt := st.chat_input("e.g. high-protein dinner under 600 kcal, ready in 30
         st.markdown(prompt)
     with st.chat_message("assistant"), st.spinner("Searching recipes…"):
         try:
-            result = httpx.post(f"{API_URL}/chat", json={"question": prompt}, timeout=60).json()
+            result = httpx.post(
+                f"{API_URL}/chat",
+                json={"question": prompt, "thread_id": st.session_state.thread_id},
+                timeout=60,
+            ).json()
         except httpx.HTTPError:
             st.error(f"Can't reach the API at {API_URL}. Is it running? (uvicorn api:app)")
             st.stop()
