@@ -13,7 +13,7 @@ from langgraph.prebuilt import ToolNode
 from ragu.prompt_loader import render_prompt
 from ragu.tools import search_recipes, search_reviews
 
-from langfuse import observe, propagate_attributes
+from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
 
 
@@ -79,7 +79,7 @@ def agent_node(state: State) -> dict:
 def tool_router(state: State) -> str:
     if state.final_answer:
         return "end"
-    elif state.iteration > 2:
+    elif state.iteration > 3:  # allow recipes->reviews->answer (+1 stumble) before force-ending
         return "end"
     elif len(state.messages[-1].tool_calls) > 0:
         return "tools"
@@ -159,7 +159,7 @@ def run_agent(question: str, thread_id: str) -> dict:
         with PostgresSaver.from_conn_string(CONNECTION_STRING) as checkpointer:
             graph = builder.compile(checkpointer=checkpointer)
             result = graph.invoke(
-                initial_state, 
+                initial_state,
                 config={
                     "callbacks": [langfuse_handler],
                     "configurable": {"thread_id": thread_id}
@@ -176,4 +176,5 @@ def run_agent(question: str, thread_id: str) -> dict:
       "references": result.get("references", []),
       "question_relevant": result.get("question_relevant", True),
       "iteration": result.get("iteration", 0),
+      "trace_id": get_client().get_current_trace_id(),
   }
