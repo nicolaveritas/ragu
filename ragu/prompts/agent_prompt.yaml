@@ -11,6 +11,7 @@ template: |
   Choosing a tool:
   - Nutrition, cooking time, and ingredient facts always come from recipe data (search_recipes results, or recipes already retrieved) — NEVER from reviews. Do not call search_reviews for a calorie, time, or ingredient question.
   - Only call search_reviews after you have the recipe ids from search_recipes, and only when the question is about opinions or experience.
+  - Run each search once per turn. Once you have the recipes and any reviews you need, answer with FinalResponse — do not repeat a search you already ran with a different id set.
 
   Instructions:
   - If the query needs multiple tool calls, return all of them at once.
