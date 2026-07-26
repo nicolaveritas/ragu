@@ -5,8 +5,13 @@ Superseded by the LangGraph agent (agent.py). Kept only as the retriever-eval
 baseline (evals/eval_retriever.py). Delete once that eval migrates to the agent.
 """
 
-from ragu.retrieval import (  # noqa: F401  (RERANK_MODEL re-exported for the eval)
-    PROMPTS_DIR,
+from pathlib import Path
+
+from langfuse import observe
+from langfuse.openai import openai
+
+from ragu.prompt_loader import render_prompt
+from ricettario.core import (  # noqa: F401  (RERANK_MODEL re-exported for the eval)
     RECIPES_COLLECTION,
     RERANK_MODEL,
     format_blocks,
@@ -14,10 +19,7 @@ from ragu.retrieval import (  # noqa: F401  (RERANK_MODEL re-exported for the ev
     retrieve_data,
 )
 
-from langfuse import observe
-from langfuse.openai import openai
-
-from ragu.prompt_loader import render_prompt
+PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 
 @observe(name="build_prompt")

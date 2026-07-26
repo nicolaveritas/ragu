@@ -1,7 +1,19 @@
-from langchain_core.tools import tool
-from ragu.retrieval import format_blocks, format_reviews, rerank, retrieve_data, retrieve_reviews
+"""MCP adapter: the two tools the agent calls, over streamable HTTP (or stdio).
 
-@tool
+The docstrings below are prompt, not documentation: FastMCP ships them to the model
+as the tool descriptions, and they are all it has to decide when to call a tool and
+what to put in the arguments. Editing them changes agent behaviour.
+"""
+
+from fastmcp import FastMCP
+
+from ricettario.adapters.render import reviews_to_llm_text, to_llm_text
+from ricettario.core import retrieve_and_rerank, retrieve_reviews
+
+mcp = FastMCP("ricettario")
+
+
+@mcp.tool
 def search_recipes(query: str, top_k: int = 5) -> str:
     """Search the recipe database and return the most relevant recipes.
 
@@ -17,20 +29,11 @@ def search_recipes(query: str, top_k: int = 5) -> str:
         total time, ingredients and steps. Starts with a note if no recipe
         satisfied the numeric constraints (closest matches are shown instead).
     """
-    retrieved = retrieve_data(query, k=20)
-    recipes = rerank(query, retrieved["recipes"], top_n=top_k)
-    if not recipes:
-        return "No recipes found for this query. Try rephrasing or broadening it."
-    text = "\n\n".join(format_blocks(recipes))
-    if retrieved["filter_relaxed"]:
-        text = (
-            "Note: no recipes matched the numeric constraints; "
-            "showing the closest matches instead.\n\n" + text
-        )
-    return text
+    found = retrieve_and_rerank(query, top_k=top_k)
+    return to_llm_text(found["recipes"], filter_relaxed=found["filter_relaxed"])
 
 
-@tool
+@mcp.tool
 def search_reviews(recipe_ids: list[int], query: str, top_k: int = 5) -> str:
     """Search user reviews for specific recipes.
 
@@ -49,5 +52,4 @@ def search_reviews(recipe_ids: list[int], query: str, top_k: int = 5) -> str:
     Returns:
         One line per review, tagged with its recipe id and star rating.
     """
-    reviews = retrieve_reviews(query, recipe_ids=recipe_ids, k=top_k)
-    return format_reviews(reviews)
+    return reviews_to_llm_text(retrieve_reviews(query, recipe_ids=recipe_ids, k=top_k))

@@ -1,14 +1,22 @@
-"""FastAPI service exposing the ragu agent. Run: uvicorn api:app --reload"""
+"""FastAPI service exposing the ragu agent. Run: uvicorn api:app --reload
 
+Recipe cards are hydrated from ricettario over HTTP once the agent has answered.
+"""
+
+import os
+
+import httpx
 from fastapi import FastAPI
 from langfuse import get_client
 from pydantic import BaseModel
 
 from ragu.agent import run_agent
-from ragu.retrieval import fetch_recipes_by_ids
+
+RICETTARIO_URL = os.getenv("RICETTARIO_URL", "http://localhost:8001")
 
 app = FastAPI(title="Ragù API")
 langfuse = get_client()
+ricettario = httpx.AsyncClient(base_url=RICETTARIO_URL, timeout=30)
 
 
 class Query(BaseModel):
@@ -23,13 +31,16 @@ class Feedback(BaseModel):
 
 
 @app.post("/chat")
-def chat(q: Query):
-    result = run_agent(q.question, q.thread_id)
-    recipes = fetch_recipes_by_ids([r["id"] for r in result["references"]])
+async def chat(q: Query):
+    result = await run_agent(q.question, q.thread_id)
+    response = await ricettario.get(
+        "/api/v1/recipes", params={"ids": [r["id"] for r in result["references"]]}
+    )
+    response.raise_for_status()
     return {
         "question": result["question"],
         "answer": result["answer"],
-        "recipes": recipes,
+        "recipes": response.json(),
         "trace_id": result["trace_id"],
     }
 

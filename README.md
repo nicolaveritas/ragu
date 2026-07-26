@@ -25,13 +25,19 @@ Then point the ingestion pipeline at the downloaded `recipes.parquet` / `reviews
 
 ## Running
 
-The pipeline is served by a FastAPI backend; the Streamlit UI is a client that talks to it over HTTP. Copy `.env.example` to `.env` and fill in the keys, then:
+Three local processes: **ricettario** owns all knowledge access (recipe/review search over
+MCP for the agent, recipe cards over HTTP for the app), the **API** runs the agent, and the
+Streamlit **UI** talks to the API over HTTP. Copy `.env.example` to `.env` and fill in the
+keys, then:
 
 ```bash
 ./run.sh
 ```
 
-This starts Qdrant + Langfuse (Docker) and runs the API (:8000, docs at `/docs`) and UI (:8501) with hot reload; Ctrl-C stops the local app, `docker compose down` the containers. Set `RAGU_API_URL` if the API lives elsewhere.
+This starts Qdrant + Langfuse (Docker) and runs ricettario (:8001, MCP at `/mcp`, HTTP at
+`/api/v1`), the API (:8000, docs at `/docs`) and the UI (:8501) with hot reload; Ctrl-C stops
+the local apps, `docker compose down` the containers. Set `RAGU_API_URL`, `RICETTARIO_URL`
+or `RICETTARIO_MCP_URL` if anything lives elsewhere.
 
 ## Status
 

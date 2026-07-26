@@ -12,8 +12,9 @@ from langfuse import observe
 from langfuse.openai import openai  # drop-in replacement: auto-traces every OpenAI call
 from qdrant_client import QdrantClient
 
-# ragu/prompts — this file is ragu/retrieval/_shared.py, so parent.parent == ragu/
-PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
+# ricettario/core/prompts — retrieval owns its own prompts (constraint extraction);
+# the agent's prompts stay in ragu/prompts.
+PROMPTS_DIR = Path(__file__).parent / "prompts"
 RERANK_MODEL = "ms-marco-MiniLM-L-12-v2"
 
 qdrant_client = QdrantClient(url=os.getenv("QDRANT_URL", "http://localhost:6333"))

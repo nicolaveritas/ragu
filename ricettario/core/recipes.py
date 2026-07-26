@@ -2,7 +2,8 @@
 
 Public API (bottom of file):
     retrieve_data        - hybrid search with numeric-constraint filtering + fallback
-    fetch_recipes_by_ids - full recipe cards for known ids (api.py card lookups)
+    retrieve_and_rerank  - retrieve_data + rerank, the default search config
+    fetch_recipes_by_ids - full recipe cards for known ids (HTTP card lookups)
     format_blocks        - render recipe dicts into the text blocks the LLM reads
 
 Reranking is generic and lives in _shared.rerank. This module owns everything
@@ -13,14 +14,20 @@ Ordered definition-before-use: models, then _private helpers, then public API.
 from typing import Literal
 
 import instructor
+import yaml
 from langfuse import observe
 from pydantic import BaseModel, Field
 from qdrant_client import models
 
-from ragu.prompt_loader import render_prompt
-from ragu.retrieval._shared import PROMPTS_DIR, get_embedding, qdrant_client
+from ricettario.core._shared import PROMPTS_DIR, get_embedding, qdrant_client, rerank
 
 RECIPES_COLLECTION = "Recipes-collection-01-hybrid"
+
+# One prompt, no template variables: read it directly rather than import ragu's
+# Jinja loader — nothing in ricettario imports from ragu.
+EXTRACT_CONSTRAINTS_PROMPT = yaml.safe_load(
+    (PROMPTS_DIR / "extract_constraints.yaml").read_text()
+)["template"].strip()
 
 
 # ============================ Query-understanding model =======================
@@ -73,7 +80,7 @@ def _extract_constraints(query: str) -> ExtractedConstraints:
     # tokens captured once). We just wrap it in a clearly-named span.
     return _extractor_client.create(
         messages=[
-            {"role": "system", "content": render_prompt(PROMPTS_DIR, "extract_constraints")},
+            {"role": "system", "content": EXTRACT_CONSTRAINTS_PROMPT},
             {"role": "user", "content": query},
         ],
         reasoning={"effort": "none"},
@@ -178,6 +185,16 @@ def retrieve_data(query, k=5, collection_name=RECIPES_COLLECTION, hybrid=True):
         "recipes": recipes,
         "constraints": [c.model_dump() for c in out["constraints"]],
         "filter_relaxed": out["filter_relaxed"],
+    }
+
+
+@observe(name="retrieve_and_rerank")
+def retrieve_and_rerank(query, top_k=5, candidates=20):
+    """The default recipe search: wide fusion recall, then rerank down to top_k."""
+    retrieved = retrieve_data(query, k=candidates)
+    return {
+        "recipes": rerank(query, retrieved["recipes"], top_n=top_k),
+        "filter_relaxed": retrieved["filter_relaxed"],
     }
 
 

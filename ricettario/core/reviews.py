@@ -1,6 +1,6 @@
 """Review retrieval: semantic search over reviews, prefiltered by RecipeId.
 
-The agent's second tool. `search_recipes` returns recipe ids; those ids feed
+Backs the agent's second tool. `search_recipes` returns recipe ids; those ids feed
 `retrieve_reviews` as a hard filter, then dense similarity ranks the surviving
 reviews by relevance to the query. Dense-only collection (no BM25) — see
 notebook 12.
@@ -9,7 +9,7 @@ notebook 12.
 from langfuse import observe
 from qdrant_client.models import Filter, FieldCondition, MatchAny
 
-from ragu.retrieval._shared import get_embedding, qdrant_client
+from ricettario.core._shared import get_embedding, qdrant_client
 
 REVIEWS_COLLECTION = "Recipes-reviews-collection-01"
 
@@ -34,13 +34,3 @@ def retrieve_reviews(query, recipe_ids, k=5, collection_name=REVIEWS_COLLECTION)
         limit=k,
     )
     return [payload_to_review(p.payload, p.score) for p in results.points]
-
-
-def format_reviews(reviews):
-    if not reviews:
-        return "No reviews found for these recipes."
-    lines = []
-    for r in reviews:
-        rating = f"[{r['rating']}/5] " if r.get("rating") is not None else ""
-        lines.append(f"- recipe {r['recipe_id']} {rating}{r['review']}")
-    return "\n".join(lines)

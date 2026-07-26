@@ -1,17 +1,18 @@
 import os
+from functools import partial
 from operator import add
 from pathlib import Path
 from typing import Annotated, Any
 import instructor
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, convert_to_openai_messages
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 from langgraph.prebuilt import ToolNode
 
 from ragu.prompt_loader import render_prompt
-from ragu.tools import search_recipes, search_reviews
 
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
@@ -21,6 +22,11 @@ langfuse_handler = CallbackHandler()
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 CONNECTION_STRING = os.getenv("POSTGRES_CONNECTION_STRING")
+RICETTARIO_MCP_URL = os.getenv("RICETTARIO_MCP_URL", "http://localhost:8001/mcp")
+
+mcp_client = MultiServerMCPClient(
+    {"ricettario": {"url": RICETTARIO_MCP_URL, "transport": "http"}}
+)
 
 
 class RAGUsedContext(BaseModel):
@@ -47,13 +53,16 @@ class State(BaseModel):
     references: list[RAGUsedContext] = []
 
 
-agent_llm = ChatOpenAI(
+llm = ChatOpenAI(
     model="gpt-5.4-mini",
     reasoning_effort="low",
     use_responses_api=True,
-).bind_tools([search_recipes, search_reviews, FinalResponse], tool_choice="required")
+)
 
-def agent_node(state: State) -> dict:
+
+# agent_llm arrives from build_graph via partial: the tools it is bound to come from
+# ricettario over MCP, so they don't exist yet at import time.
+def agent_node(state: State, agent_llm) -> dict:
     prompt = render_prompt(PROMPTS_DIR, "agent_prompt")
     response = agent_llm.invoke([SystemMessage(content=prompt), *state.messages])
 
@@ -122,43 +131,54 @@ def intent_router_conditional_edges(state: State) -> str:
         return "end"
 
 
-builder = (
-    StateGraph(State)
-    .add_node("tool_node", ToolNode([search_recipes, search_reviews]))
-    .add_node("intent_router_node", intent_router_node)
-    .add_node("agent_node", agent_node)
-    .add_edge(START, "intent_router_node")
-    .add_conditional_edges(
-        "intent_router_node",
-        intent_router_conditional_edges,
-        {
-            "agent_node": "agent_node",
-            "end": END
-        }
+async def build_graph():
+    """Wire the graph around the tools ricettario advertises, asked for every run.
+
+    The tool list costs one ~10ms round-trip against several seconds of agent work,
+    so it isn't cached: editing a tool docstring in ricettario takes effect on the
+    next question instead of needing a restart.
+    """
+    tools = await mcp_client.get_tools()
+    agent_llm = llm.bind_tools([*tools, FinalResponse], tool_choice="required")
+    return (
+        StateGraph(State)
+        .add_node("tool_node", ToolNode(tools))
+        .add_node("intent_router_node", intent_router_node)
+        .add_node("agent_node", partial(agent_node, agent_llm=agent_llm))
+        .add_edge(START, "intent_router_node")
+        .add_conditional_edges(
+            "intent_router_node",
+            intent_router_conditional_edges,
+            {
+                "agent_node": "agent_node",
+                "end": END
+            }
+        )
+        .add_conditional_edges(
+            "agent_node",
+            tool_router,
+            {
+                "tools": "tool_node",
+                "end": END
+            }
+        )
+        .add_edge("tool_node", "agent_node")
     )
-    .add_conditional_edges(
-        "agent_node",
-        tool_router,
-        {
-            "tools": "tool_node",
-            "end": END
-        }
-    )
-    .add_edge("tool_node", "agent_node")
-)
 
 
+# Async because the MCP tools are async-only: a sync graph.invoke() can't call them.
 @observe(name="run_agent")
-def run_agent(question: str, thread_id: str) -> dict:
+async def run_agent(question: str, thread_id: str) -> dict:
     initial_state = {
         "messages": [HumanMessage(content=question)],
         "iteration": 0,
     }
 
+    builder = await build_graph()
     with propagate_attributes(session_id=thread_id):
-        with PostgresSaver.from_conn_string(CONNECTION_STRING) as checkpointer:
+        async with AsyncPostgresSaver.from_conn_string(CONNECTION_STRING) as checkpointer:
             graph = builder.compile(checkpointer=checkpointer)
-            result = graph.invoke(
+            result = await graph.ainvoke(
                 initial_state,
                 config={
                     "callbacks": [langfuse_handler],
