@@ -3,14 +3,16 @@
 Recipe cards are hydrated from ricettario over HTTP once the agent has answered.
 """
 
+import json
 import os
 
 import httpx
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from langfuse import get_client
 from pydantic import BaseModel
 
-from ragu.agent import run_agent
+from ragu.agent import stream_agent
 
 RICETTARIO_URL = os.getenv("RICETTARIO_URL", "http://localhost:8001")
 
@@ -30,19 +32,25 @@ class Feedback(BaseModel):
     comment: str = ""
 
 
+async def sse(question: str, thread_id: str):
+    """Re-emit agent events as SSE frames: `data: {json}\\n\\n`, one JSON object per frame.
+
+    Recipe cards are hydrated here, on the way out, so the status frames reach the
+    browser while the agent works and the card fetch only delays the last frame.
+    """
+    async for event in stream_agent(question, thread_id):
+        if event["type"] == "final":
+            response = await ricettario.get(
+                "/api/v1/recipes", params={"ids": [r["id"] for r in event["references"]]}
+            )
+            response.raise_for_status()
+            event = {**event, "recipes": response.json()}
+        yield f"data: {json.dumps(event)}\n\n"
+
+
 @app.post("/chat")
 async def chat(q: Query):
-    result = await run_agent(q.question, q.thread_id)
-    response = await ricettario.get(
-        "/api/v1/recipes", params={"ids": [r["id"] for r in result["references"]]}
-    )
-    response.raise_for_status()
-    return {
-        "question": result["question"],
-        "answer": result["answer"],
-        "recipes": response.json(),
-        "trace_id": result["trace_id"],
-    }
+    return StreamingResponse(sse(q.question, q.thread_id), media_type="text/event-stream")
 
 
 @app.post("/feedback")

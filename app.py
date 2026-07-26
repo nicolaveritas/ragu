@@ -1,5 +1,6 @@
 """Streamlit chat UI for ragu: chat in the main area, retrieved recipes in the sidebar."""
 
+import json
 import os
 import uuid
 
@@ -104,16 +105,30 @@ if prompt := st.chat_input("e.g. high-protein dinner under 600 kcal, ready in 30
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
-    with st.chat_message("assistant"), st.spinner("Searching recipes…"):
+    with st.chat_message("assistant"):
+        # One placeholder rewritten per status frame, so progress replaces itself in place.
+        status = st.empty()
+        result = None
         try:
-            result = httpx.post(
+            with httpx.stream(
+                "POST",
                 f"{API_URL}/chat",
                 json={"question": prompt, "thread_id": st.session_state.thread_id},
                 timeout=60,
-            ).json()
+            ) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    event = json.loads(line.removeprefix("data: "))
+                    if event["type"] == "status":
+                        status.markdown(f"*{event['text']}*")
+                    else:
+                        result = event
         except httpx.HTTPError:
             st.error(f"Can't reach the API at {API_URL}. Is it running? (uvicorn api:app)")
             st.stop()
+        status.empty()
         st.markdown(result["answer"])
     st.session_state.messages.append(
         {"role": "assistant", "content": result["answer"], "trace_id": result.get("trace_id")}

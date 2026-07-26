@@ -166,35 +166,83 @@ async def build_graph():
     )
 
 
+TOOL_STATUS = {
+    "search_recipes": "Searching recipes…",
+    "search_reviews": "Reading what people cooked…",
+}
+
+
+def _status(update: dict) -> str:
+    """Turn one `updates` chunk — {node_name: state_delta} — into a line for the UI.
+
+    Read the tool calls the agent just produced, not the tools already run: the call
+    names say what is about to happen, so the status lands before the wait, not after.
+    """
+    for node, delta in update.items():
+        if node == "intent_router_node":
+            return "Reading your question…"
+        if node == "agent_node" and not delta["final_answer"]:
+            names = [tc["name"] for tc in delta["messages"][-1].tool_calls]
+            return " ".join(TOOL_STATUS.get(n, f"Running {n}…") for n in names) or "Thinking…"
+    return ""
+
+
 # Async because the MCP tools are async-only: a sync graph.invoke() can't call them.
 @observe(name="run_agent")
-async def run_agent(question: str, thread_id: str) -> dict:
+async def stream_agent(question: str, thread_id: str):
+    """Run the graph and yield events as they happen, instead of one dict at the end.
+
+    Same run as before, only consumed step by step: astream hands back a chunk per
+    node, so the seconds spent in retrieval become progress lines instead of a spinner.
+    Two stream modes at once — `updates` (what a node just changed, for status text)
+    and `values` (the whole state, whose last chunk is the final state).
+
+    Yields {"type": "status", "text": ...} zero or more times, then exactly one
+    {"type": "final", ...} carrying the same payload run_agent used to return.
+    """
     initial_state = {
         "messages": [HumanMessage(content=question)],
         "iteration": 0,
     }
 
+    result = State()
     builder = await build_graph()
     with propagate_attributes(session_id=thread_id):
         async with AsyncPostgresSaver.from_conn_string(CONNECTION_STRING) as checkpointer:
             graph = builder.compile(checkpointer=checkpointer)
-            result = await graph.ainvoke(
+            async for chunk in graph.astream(
                 initial_state,
                 config={
                     "callbacks": [langfuse_handler],
                     "configurable": {"thread_id": thread_id}
-                }
-            )
+                },
+                stream_mode=["updates", "values"],
+                version="v2",
+            ):
+                if chunk["type"] == "values":
+                    result = chunk["data"]  # last one wins: the state at END
+                elif text := _status(chunk["data"]):
+                    yield {"type": "status", "text": text}
+
+    # A `values` chunk is the State model, not the dict ainvoke returned: dump it so
+    # references land as plain dicts whatever pydantic coerced them into.
+    final = result.model_dump(include={"answer", "references", "question_relevant", "iteration"})
 
     # Relevant question but the loop hit the iteration cap without a FinalResponse:
     # never hand the UI a blank bubble. (Off-topic path already carries the router's reply.)
-    answer = result.get("answer") or "Sorry, I couldn't put that together — could you rephrase or narrow it down?"
+    answer = final["answer"] or "Sorry, I couldn't put that together — could you rephrase or narrow it down?"
 
-    return {
-      "question": question,
-      "answer": answer,
-      "references": result.get("references", []),
-      "question_relevant": result.get("question_relevant", True),
-      "iteration": result.get("iteration", 0),
-      "trace_id": get_client().get_current_trace_id(),
-  }
+    yield {
+        "type": "final",
+        "question": question,
+        **final,
+        "answer": answer,
+        "trace_id": get_client().get_current_trace_id(),
+    }
+
+
+async def run_agent(question: str, thread_id: str) -> dict:
+    """Blocking shortcut for callers with nothing to show mid-run (evals, notebooks)."""
+    async for event in stream_agent(question, thread_id):
+        if event["type"] == "final":
+            return event
